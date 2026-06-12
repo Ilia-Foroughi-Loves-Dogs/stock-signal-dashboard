@@ -34,6 +34,11 @@ FUNDAMENTAL_FIELDS = {
     "recommendationKey": "analyst_recommendation",
     "quoteType": "quote_type",
 }
+EARNINGS_FIELDS = (
+    "earningsTimestamp",
+    "earningsTimestampStart",
+    "earningsTimestampEnd",
+)
 
 
 def clean_ticker(ticker: str) -> str:
@@ -259,6 +264,17 @@ def load_company_info(ticker: str, retries: int = 1) -> dict[str, Any]:
                     "company_name", "short_name", "sector", "industry",
                     "analyst_recommendation", "quote_type",
                 } else _number(value)
+            earnings_timestamps = [
+                _number(info.get(field)) for field in EARNINGS_FIELDS
+            ]
+            future_earnings = [
+                value for value in earnings_timestamps
+                if value is not None and value >= time.time()
+            ]
+            result["earnings_date"] = (
+                pd.to_datetime(min(future_earnings), unit="s", utc=True).isoformat()
+                if future_earnings else None
+            )
             result["company_name"] = result.get("company_name") or result.get("short_name") or symbol
             result["sector"] = result.get("sector") or "Unknown"
             result["industry"] = result.get("industry") or "Unknown"

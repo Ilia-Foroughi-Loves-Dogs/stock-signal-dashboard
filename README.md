@@ -21,6 +21,14 @@ rules, and records fake-money paper trades.
 - Calculates trend, momentum, volume, volatility, drawdown, support/resistance,
   breakout, and fundamental features
 - Produces a transparent 0-100 quant score and watch-oriented labels
+- Replays historical Buy Watch setups and reports 5/10/20-day returns, 10-day
+  win rate, worst post-signal drawdown, signal count, and buy-and-hold comparison
+- Rates signal quality as Excellent, Good, Weak, or Not enough data; strong
+  ratings require at least 10 historical observations and Excellent requires 20
+- Detects the SPY 200-day-SMA market regime, penalizes bearish conditions, and
+  rewards relative strength versus SPY and, for growth sectors, QQQ
+- Adds best-effort earnings dates and explicit do-not-buy warnings for nearby
+  earnings, low volume, extreme volatility, extended prices, and weak history
 - Trains Random Forest, Gradient Boosting, and Logistic Regression candidates
   with time-ordered validation for 5, 10, and 20-session direction
 - Shows model accuracy, precision, recall, and majority-class baseline
@@ -65,6 +73,9 @@ python -m streamlit run app.py
 
 Start with **Full Market Scanner**, choose a scan limit of **50**, and run the
 scan. This validates Yahoo/Nasdaq access and gives a realistic speed estimate.
+The default two-year history usually provides a more meaningful Strategy
+Quality sample than one year; use five years when stronger validation depth is
+more important than scan speed.
 
 For a larger scan, choose 500 or 1,000. To request every discovered symbol,
 choose **All** and enable **Full scan mode**. Large scans can take a long time,
@@ -77,15 +88,18 @@ Enable **Resume previous scan results** to skip symbols already stored in
 
 1. **Full Market Scanner** builds, filters, analyzes, ranks, and exports
    `scanner_results.csv`.
-2. **Best Chances** groups strong watches, risk/reward candidates, momentum
+2. **Strategy Quality** audits each scanned ticker's historical signals,
+   forward returns, drawdown, sample size, market regime, relative strength,
+   earnings date, and warnings.
+3. **Best Chances** groups strong watches, risk/reward candidates, momentum
    breakouts, quality trends, and sell/exit watches.
-3. **Single Stock Deep Dive** shows charts, indicators, score sections, ML
+4. **Single Stock Deep Dive** shows charts, indicators, score sections, ML
    probability, planning zones, and exit conditions.
-4. **AI Analyst** explains only selected top/worst candidates.
-5. **Backtest** starts with $10,000 fake cash and compares the strategy with
+5. **AI Analyst** explains only selected top/worst candidates.
+6. **Backtest** starts with $10,000 fake cash and compares the strategy with
    buy-and-hold.
-6. **Paper Trading** records confirmed fake buys/sells in `paper_trades.csv`.
-7. **Risk Manager** limits risk per trade and allocation per position.
+7. **Paper Trading** records confirmed fake buys/sells in `paper_trades.csv`.
+8. **Risk Manager** limits risk per trade and allocation per position.
 
 ## Scoring
 
@@ -102,6 +116,30 @@ The deterministic sections total 90 points. The 10-session model probability
 contributes the final 0-10 points. Missing ML data receives a neutral 5 points;
 missing fundamentals simply do not earn unavailable quality points.
 
+After that base score, market context applies a bounded adjustment. A bearish
+SPY regime subtracts 8 points. Twenty-day outperformance versus SPY can add up
+to 3 points, while material underperformance can subtract 2. Stocks in
+technology, communication services, or consumer cyclical sectors can gain up
+to 2 additional points for outperforming QQQ.
+
+## Strategy Quality
+
+Historical validation uses the same deterministic score rules, without current
+fundamentals or ML predictions to avoid applying today's unavailable data to
+the past. A historical observation is recorded when the score is at least 65,
+with at least 10 trading sessions between observations. Results use only
+signals with a complete 20-session forward window.
+
+- Win rate is the percentage of signals with a positive 10-session return.
+- Max drawdown is the worst price decline observed within 20 sessions after a
+  signal.
+- Buy-and-hold comparison shows the full-period return and the average rolling
+  10-session return over the same available history.
+- Fewer than 10 signals always produces **Not enough data**.
+- **Excellent** requires at least 20 signals plus stronger return, win-rate,
+  excess-return, and drawdown thresholds.
+- Missing benchmark, earnings, or historical values are displayed as `N/A`.
+
 Labels are: Elite Buy Watch, Strong Buy Watch, Buy Watch, Neutral / Wait,
 Weak / Avoid, and Sell / Exit Watch. They are watchlist labels, not orders.
 
@@ -117,6 +155,8 @@ Weak / Avoid, and Sell / Exit Watch. They are watchlist labels, not orders.
   classes are imbalanced. Accuracy above baseline does not imply profitability.
 - The universe and data introduce survivorship, selection, and availability
   bias. Backtests use daily bars and simplified stop/target fill assumptions.
+- Strategy Quality results overlap in time, do not include execution costs, and
+  are descriptive rather than proof that future signals will be profitable.
 - Backtests omit taxes, dividends, borrow costs, partial fills, realistic
   spreads, market impact, and intraday path ordering when both stop and target
   are touched.

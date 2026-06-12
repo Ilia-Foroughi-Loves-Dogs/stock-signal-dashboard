@@ -15,6 +15,14 @@ from ml_model import train_model
 from signals import combined_decision, get_latest_signal
 from config import FAILED_TICKERS_FILE, SCANNER_RESULTS_FILE
 from risk import risk_warnings
+from strategy_quality import (
+    do_not_buy_warnings,
+    is_growth_sector,
+    market_regime,
+    market_score_adjustment,
+    relative_strength_20d,
+    validate_historical_signals,
+)
 
 
 def analyze_ticker(
@@ -24,6 +32,7 @@ def analyze_ticker(
     info_loader: Callable[[str], dict] = load_company_info,
     run_ml: bool = True,
     metadata: dict | None = None,
+    benchmark_data: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     prices = add_indicators(price_loader(ticker, period))
     fundamentals = info_loader(ticker)
@@ -31,7 +40,29 @@ def analyze_ticker(
     ml = train_model(prices, ticker) if run_ml else {
         "accuracy": None, "probability_up_10d": None, "probability_down_10d": None
     }
-    decision = combined_decision(signal, ml.get("probability_up_10d"), fundamentals)
+    benchmarks = benchmark_data or {}
+    spy_data = benchmarks.get("SPY")
+    qqq_data = benchmarks.get("QQQ")
+    regime = market_regime(spy_data)
+    relative_spy = relative_strength_20d(prices, spy_data)
+    relative_qqq = (
+        relative_strength_20d(prices, qqq_data)
+        if is_growth_sector(fundamentals.get("sector")) else None
+    )
+    adjustment, adjustment_reasons = market_score_adjustment(
+        regime, relative_spy, relative_qqq
+    )
+    decision = combined_decision(
+        signal,
+        ml.get("probability_up_10d"),
+        fundamentals,
+        adjustment,
+        adjustment_reasons,
+    )
+    quality = validate_historical_signals(prices)
+    warnings = do_not_buy_warnings(
+        decision, quality, fundamentals.get("earnings_date")
+    )
     return {
         "ticker": ticker,
         "data": prices,
@@ -39,6 +70,13 @@ def analyze_ticker(
         "signal": signal,
         "ml": ml,
         "decision": decision,
+        "quality": quality,
+        "market_context": {
+            "market_regime": regime,
+            "relative_strength_spy_pct": relative_spy,
+            "relative_strength_qqq_pct": relative_qqq,
+        },
+        "warnings": warnings,
         "metadata": metadata or {},
     }
 
@@ -48,10 +86,13 @@ def _result_row(ticker: str, analysis: dict) -> dict:
     info = analysis["fundamentals"]
     probability = decision["probability_up_10d"]
     metadata = analysis.get("metadata", {})
+    quality = analysis.get("quality", {})
+    market_context = analysis.get("market_context", {})
     warnings = risk_warnings(
         decision["final_score"], decision.get("atr_pct", 0),
         average_volume=decision["volume_avg_20"],
     )
+    warnings.extend(analysis.get("warnings", []))
     return {
         "Ticker": ticker,
         "Company": info.get("company_name", ticker),
@@ -62,6 +103,30 @@ def _result_row(ticker: str, analysis: dict) -> dict:
         "Daily %": decision["daily_change_pct"],
         "Signal": decision["final_signal"],
         "Final Score": decision["final_score"],
+        "Signal Quality": quality.get("signal_quality", "Not enough data"),
+        "Historical 5D Return": quality.get("average_return_5d_pct"),
+        "Historical 10D Return": quality.get("average_return_10d_pct"),
+        "Historical 20D Return": quality.get("average_return_20d_pct"),
+        "Historical Win Rate": quality.get("historical_win_rate_pct"),
+        "Max Drawdown After Signal": quality.get(
+            "max_drawdown_after_signal_pct"
+        ),
+        "Historical Signals": quality.get("historical_signal_count", 0),
+        "Buy-and-Hold Return": quality.get("buy_and_hold_return_pct"),
+        "Buy-and-Hold Average 10D Return": quality.get(
+            "buy_and_hold_average_10d_pct"
+        ),
+        "Excess vs Buy-and-Hold 10D": quality.get(
+            "excess_return_vs_buy_hold_10d_pct"
+        ),
+        "Market Regime": market_context.get("market_regime", "N/A"),
+        "Relative Strength vs SPY": market_context.get(
+            "relative_strength_spy_pct"
+        ),
+        "Relative Strength vs QQQ": market_context.get(
+            "relative_strength_qqq_pct"
+        ),
+        "Earnings Date": info.get("earnings_date"),
         "Quant Score": decision["quant_score"],
         "ML Probability Up 10D": None if probability is None else probability * 100,
         "RSI": decision["rsi"],
@@ -72,7 +137,7 @@ def _result_row(ticker: str, analysis: dict) -> dict:
         "Take-Profit Idea": decision["take_profit_2r"],
         "Risk/Reward": decision["risk_reward_ratio"],
         "ATR %": decision.get("atr_pct"),
-        "Warning": "; ".join(warnings),
+        "Warning": "; ".join(dict.fromkeys(warnings)) or "N/A",
     }
 
 
@@ -89,6 +154,9 @@ def _lightweight_analysis(analysis: dict) -> dict:
         "signal": analysis["signal"],
         "ml": ml,
         "decision": analysis["decision"],
+        "quality": analysis.get("quality", {}),
+        "market_context": analysis.get("market_context", {}),
+        "warnings": analysis.get("warnings", []),
         "metadata": analysis.get("metadata", {}),
     }
 
@@ -102,6 +170,7 @@ def scan_tickers(
     progress_callback: Callable[[str, int], None] | None = None,
     max_workers: int = 8,
     metadata: dict[str, dict] | None = None,
+    benchmark_data: dict[str, pd.DataFrame] | None = None,
     save_results: bool = True,
     resume_results: pd.DataFrame | None = None,
     return_summary: bool = False,
@@ -153,6 +222,7 @@ def scan_tickers(
                     info_loader,
                     run_ml,
                     (metadata or {}).get(ticker),
+                    benchmark_data,
                 ): ticker
                 for ticker in pending_symbols
             }

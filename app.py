@@ -46,7 +46,14 @@ def cached_universe(source: str, asset_type: str, include_otc: bool):
 
 
 def analysis_for(ticker: str, period: str, ml: bool = True) -> dict:
-    return analyze_ticker(ticker, period, cached_prices, cached_info, ml)
+    benchmarks = {
+        symbol: add_indicators(cached_prices(symbol, period))
+        for symbol in ("SPY", "QQQ")
+    }
+    return analyze_ticker(
+        ticker, period, cached_prices, cached_info, ml,
+        benchmark_data=benchmarks,
+    )
 
 
 def ai_payload(analysis: dict) -> dict:
@@ -139,6 +146,16 @@ def result_table(frame: pd.DataFrame) -> None:
         "Latest Price": safe_money,
         "Daily %": safe_percent,
         "Final Score": safe_number,
+        "Historical 5D Return": safe_percent,
+        "Historical 10D Return": safe_percent,
+        "Historical 20D Return": safe_percent,
+        "Historical Win Rate": safe_percent,
+        "Max Drawdown After Signal": safe_percent,
+        "Buy-and-Hold Return": safe_percent,
+        "Buy-and-Hold Average 10D Return": safe_percent,
+        "Excess vs Buy-and-Hold 10D": safe_percent,
+        "Relative Strength vs SPY": safe_percent,
+        "Relative Strength vs QQQ": safe_percent,
         "ML Probability Up 10D": safe_percent,
         "RSI": safe_number,
         "Relative Volume": safe_ratio,
@@ -166,7 +183,7 @@ st.warning(DISCLAIMER)
 
 with st.sidebar:
     st.header("Global Settings")
-    period = st.selectbox("History period", SCAN_PERIODS, index=1)
+    period = st.selectbox("History period", SCAN_PERIODS, index=2)
     max_workers = st.slider("Max workers", 1, MAX_SCAN_WORKERS, DEFAULT_MAX_WORKERS)
     enable_ml = st.toggle("Train ML models", value=True)
     use_openai = st.toggle(
@@ -180,8 +197,9 @@ with st.sidebar:
     starting_cash = st.number_input("Starting fake cash", 1_000.0, value=DEFAULT_PAPER_CASH)
 
 tabs = st.tabs([
-    "Full Market Scanner", "Best Chances", "Single Stock Deep Dive", "AI Analyst",
-    "Backtest", "Paper Trading", "Risk Manager", "Settings",
+    "Full Market Scanner", "Strategy Quality", "Best Chances",
+    "Single Stock Deep Dive", "AI Analyst", "Backtest", "Paper Trading",
+    "Risk Manager", "Settings",
 ])
 
 with tabs[0]:
@@ -236,7 +254,20 @@ with tabs[0]:
             if ticker not in completed
         ]
         bar.progress(0, f"Loading price data for {len(pending)} tickers")
-        prefetched_prices = load_stock_data_batch(pending, period)
+        prefetched_prices = load_stock_data_batch(
+            list(dict.fromkeys(pending + ["SPY", "QQQ"])), period
+        )
+        benchmark_data = {}
+        for benchmark in ("SPY", "QQQ"):
+            try:
+                raw_benchmark = prefetched_prices.get(benchmark)
+                if raw_benchmark is None:
+                    raw_benchmark = cached_prices(benchmark, period)
+                benchmark_data[benchmark] = add_indicators(raw_benchmark)
+            except Exception as error:
+                universe_warnings.append(
+                    f"{benchmark} market context is unavailable: {error}"
+                )
 
         def scan_price_loader(ticker: str, scan_period: str) -> pd.DataFrame:
             if ticker in prefetched_prices:
@@ -245,7 +276,8 @@ with tabs[0]:
 
         results, errors, analyses, summary = scan_tickers(
             selected["ticker"], period, scan_price_loader, cached_info, enable_ml,
-            progress, max_workers, metadata, resume_results=resume_results,
+            progress, max_workers, metadata, benchmark_data,
+            resume_results=resume_results,
             return_summary=True,
         )
         summary["scan_time_seconds"] = round(perf_counter() - scan_started, 2)
@@ -298,6 +330,36 @@ with tabs[0]:
             st.dataframe(failed_frame, hide_index=True, use_container_width=True)
 
 with tabs[1]:
+    st.subheader("Strategy Quality")
+    st.caption(
+        "Historical signals replay the deterministic Buy Watch rules with at "
+        "least 10 trading days between observations. Ratings need 10 signals; "
+        "Excellent needs at least 20."
+    )
+    results = st.session_state.get("scan_results", pd.DataFrame())
+    if results.empty:
+        st.info("Run the Full Market Scanner first.")
+    else:
+        quality_columns = [
+            "Ticker", "Signal Quality", "Historical Signals",
+            "Historical Win Rate", "Historical 5D Return",
+            "Historical 10D Return", "Historical 20D Return",
+            "Max Drawdown After Signal", "Buy-and-Hold Return",
+            "Buy-and-Hold Average 10D Return",
+            "Excess vs Buy-and-Hold 10D", "Market Regime",
+            "Relative Strength vs SPY", "Relative Strength vs QQQ",
+            "Earnings Date", "Warning",
+        ]
+        available = [
+            column for column in quality_columns if column in results.columns
+        ]
+        result_table(results[available])
+        st.info(
+            "Win rate uses positive 10-trading-day outcomes. Buy-and-hold "
+            "comparison uses all rolling 10-day returns in the same history."
+        )
+
+with tabs[2]:
     st.subheader("Best Chances")
     results = st.session_state.get("scan_results", pd.DataFrame())
     analyses = st.session_state.get("scan_analyses", {})
@@ -328,7 +390,7 @@ with tabs[1]:
                     st.write(f"Invalidation: close below ${decision['stop_loss']:.2f} "
                              f"or score below 45.")
 
-with tabs[2]:
+with tabs[3]:
     st.subheader("Single Stock Deep Dive")
     deep_ticker = st.text_input("Ticker", "AAPL").strip().upper()
     if st.button("Analyze ticker", key="deep_button"):
@@ -356,7 +418,7 @@ with tabs[2]:
         show_ai(analysis, use_openai)
         st.plotly_chart(technical_chart(data), use_container_width=True)
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("AI Analyst")
     results = st.session_state.get("scan_results", pd.DataFrame())
     analyses = st.session_state.get("scan_analyses", {})
@@ -370,7 +432,7 @@ with tabs[3]:
         if ticker in analyses:
             show_ai(analyses[ticker], use_openai)
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Backtest")
     ticker = st.text_input("Backtest ticker", "SPY")
     fees = st.number_input("Fee per fake trade", 0.0, value=0.0)
@@ -398,7 +460,7 @@ with tabs[4]:
         except Exception as error:
             st.error(str(error))
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Paper Trading")
     st.info("Fake money only. Every simulated order requires confirmation.")
     ticker = st.text_input("Paper ticker", "AAPL", key="paper_ticker").upper()
@@ -422,7 +484,7 @@ with tabs[5]:
     except Exception as error:
         st.error(str(error))
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Risk Manager")
     ticker = st.text_input("Risk ticker", "AAPL", key="risk_ticker").upper()
     portfolio_value = st.number_input("Fake portfolio value", 1_000.0, value=100_000.0)
@@ -450,7 +512,7 @@ with tabs[6]:
         except Exception as error:
             st.error(str(error))
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("Settings")
     broker = connect_broker()
     st.error(broker["message"])

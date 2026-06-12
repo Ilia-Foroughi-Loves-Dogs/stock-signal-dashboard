@@ -183,15 +183,19 @@ def combined_decision(
     signal: dict[str, Any],
     probability_up: float | None,
     fundamentals: dict[str, Any] | None,
+    score_adjustment: float = 0.0,
+    adjustment_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     # Deterministic sections total 90 points; ML contributes the final 10.
     # Missing ML remains neutral rather than penalizing symbols with weak data.
     ml_points = 5.0 if probability_up is None else probability_up * 10
-    final = signal["quant_score"] + ml_points
+    base_final = signal["quant_score"] + ml_points
+    final = base_final + score_adjustment
     final = round(float(np.clip(final, 0, 100)), 1)
     confidence = round(min(95.0, 45 + abs(final - 50) * 0.8), 1)
     return {
         **signal,
+        "base_final_score": round(float(np.clip(base_final, 0, 100)), 1),
         "final_score": final,
         "final_signal": signal_from_score(final),
         "confidence": confidence,
@@ -199,4 +203,6 @@ def combined_decision(
         "probability_down_10d": None if probability_up is None else 1 - probability_up,
         "ml_score": round(ml_points, 1),
         "fundamental_score": fundamental_score(fundamentals),
+        "market_score_adjustment": round(float(score_adjustment), 1),
+        "market_adjustment_reasons": adjustment_reasons or [],
     }
