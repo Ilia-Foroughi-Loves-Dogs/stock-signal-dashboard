@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
 import yfinance as yf
-from config import CACHE_DIR
+from config import CACHE_DIR, PRICE_CACHE_TTL_HOURS, PRICE_DOWNLOAD_BATCH_SIZE
 
 REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
 FUNDAMENTAL_FIELDS = {
@@ -80,20 +81,54 @@ def _cache_path(symbol: str, period: str) -> Path:
     return CACHE_DIR / f"{symbol.replace('^', '_')}_{period}.pkl"
 
 
+def _read_cached_prices(
+    symbol: str,
+    period: str,
+    cache_ttl_hours: float,
+) -> pd.DataFrame | None:
+    cache_file = _cache_path(symbol, period)
+    if not cache_file.exists():
+        return None
+    age_seconds = time.time() - cache_file.stat().st_mtime
+    if age_seconds >= max(0, cache_ttl_hours) * 3600:
+        return None
+    try:
+        cached = pd.read_pickle(cache_file)
+        return _normalize_download(cached, symbol)
+    except Exception:
+        return None
+
+
+def _write_cached_prices(symbol: str, period: str, frame: pd.DataFrame) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = _cache_path(symbol, period)
+    temporary = cache_file.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        frame.to_pickle(temporary)
+        temporary.replace(cache_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _retry_delay(attempt: int, backoff_seconds: float) -> float:
+    return max(0, backoff_seconds) * (2 ** attempt)
+
+
 def load_stock_data(
-    ticker: str, period: str = "1y", retries: int = 2, use_disk_cache: bool = True
+    ticker: str,
+    period: str = "1y",
+    retries: int = 2,
+    use_disk_cache: bool = True,
+    cache_ttl_hours: float = PRICE_CACHE_TTL_HOURS,
+    backoff_seconds: float = 0.5,
 ) -> pd.DataFrame:
     """Download unadjusted OHLCV and adjusted close with bounded retries."""
     symbol = clean_ticker(ticker)
     yahoo_symbol = symbol.replace(".", "-")
-    cache_file = _cache_path(yahoo_symbol, period)
-    if use_disk_cache and cache_file.exists():
-        age = time.time() - cache_file.stat().st_mtime
-        if age < 6 * 3600:
-            try:
-                return pd.read_pickle(cache_file)
-            except Exception:
-                pass
+    if use_disk_cache:
+        cached = _read_cached_prices(yahoo_symbol, period, cache_ttl_hours)
+        if cached is not None:
+            return cached
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -113,14 +148,93 @@ def load_stock_data(
             if len(result) < 30:
                 raise ValueError(f"only {len(result)} usable trading days returned")
             if use_disk_cache:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                result.to_pickle(cache_file)
+                _write_cached_prices(yahoo_symbol, period, result)
             return result
         except Exception as error:
             last_error = error
             if attempt < retries:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(_retry_delay(attempt, backoff_seconds))
     raise ValueError(f"Could not download {symbol}: {last_error}") from last_error
+
+
+def _chunks(items: list[str], size: int) -> Iterable[list[str]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _batch_ticker_frame(frame: pd.DataFrame, yahoo_symbol: str) -> pd.DataFrame:
+    if not isinstance(frame.columns, pd.MultiIndex):
+        return frame
+    for level in range(frame.columns.nlevels):
+        values = frame.columns.get_level_values(level)
+        if yahoo_symbol in values:
+            return frame.xs(yahoo_symbol, axis=1, level=level, drop_level=True)
+    raise ValueError(f"{yahoo_symbol}: ticker missing from batch response")
+
+
+def load_stock_data_batch(
+    tickers: Iterable[str],
+    period: str = "1y",
+    retries: int = 2,
+    use_disk_cache: bool = True,
+    cache_ttl_hours: float = PRICE_CACHE_TTL_HOURS,
+    batch_size: int = PRICE_DOWNLOAD_BATCH_SIZE,
+    backoff_seconds: float = 0.5,
+) -> dict[str, pd.DataFrame]:
+    """Load fresh cache entries and download remaining symbols in bounded batches."""
+    symbols = list(dict.fromkeys(clean_ticker(ticker) for ticker in tickers))
+    results: dict[str, pd.DataFrame] = {}
+    missing: list[str] = []
+    for symbol in symbols:
+        yahoo_symbol = symbol.replace(".", "-")
+        cached = (
+            _read_cached_prices(yahoo_symbol, period, cache_ttl_hours)
+            if use_disk_cache else None
+        )
+        if cached is None:
+            missing.append(symbol)
+        else:
+            results[symbol] = cached
+
+    for batch in _chunks(missing, max(1, int(batch_size))):
+        yahoo_symbols = [symbol.replace(".", "-") for symbol in batch]
+        downloaded: pd.DataFrame | None = None
+        for attempt in range(retries + 1):
+            try:
+                downloaded = yf.download(
+                    yahoo_symbols,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=False,
+                    progress=False,
+                    threads=True,
+                    group_by="column",
+                    timeout=30,
+                )
+                if downloaded.empty:
+                    raise ValueError("no batch price data returned")
+                break
+            except Exception:
+                downloaded = None
+                if attempt < retries:
+                    time.sleep(_retry_delay(attempt, backoff_seconds))
+
+        if downloaded is None:
+            continue
+        for symbol, yahoo_symbol in zip(batch, yahoo_symbols):
+            try:
+                ticker_frame = _batch_ticker_frame(downloaded, yahoo_symbol)
+                normalized = _normalize_download(ticker_frame, symbol)
+                if len(normalized) < 30:
+                    continue
+                results[symbol] = normalized
+                if use_disk_cache:
+                    _write_cached_prices(yahoo_symbol, period, normalized)
+            except Exception:
+                # Missing symbols fall back to the existing per-ticker retry path.
+                continue
+    return results
 
 
 def _number(value: Any) -> float | None:
@@ -152,7 +266,7 @@ def load_company_info(ticker: str, retries: int = 1) -> dict[str, Any]:
         except Exception as error:
             last_error = str(error)
             if attempt < retries:
-                time.sleep(0.5)
+                time.sleep(_retry_delay(attempt, 0.5))
     return {
         "ticker": symbol,
         "company_name": symbol,

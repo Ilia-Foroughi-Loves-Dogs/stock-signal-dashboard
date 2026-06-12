@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from time import perf_counter
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,10 +16,10 @@ from backtest import run_backtest
 from broker import connect_broker
 from config import (
     APP_NAME, DEFAULT_MAX_ALLOCATION, DEFAULT_MAX_WORKERS, DEFAULT_PAPER_CASH,
-    DEFAULT_RISK_PER_TRADE, DISCLAIMER, MAX_SCAN_WORKERS, SCAN_PERIODS,
-    SCORE_MAXIMUMS,
+    DEFAULT_RISK_PER_TRADE, DISCLAIMER, FAILED_TICKERS_FILE, MAX_SCAN_WORKERS,
+    PRICE_CACHE_TTL_HOURS, SCANNER_RESULTS_FILE, SCAN_PERIODS, SCORE_MAXIMUMS,
 )
-from data import load_company_info, load_stock_data
+from data import load_company_info, load_stock_data, load_stock_data_batch
 from indicators import add_indicators
 from paper_trading import execute_paper_order, portfolio_summary
 from risk import position_size, risk_warnings
@@ -29,7 +30,7 @@ load_dotenv()
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=PRICE_CACHE_TTL_HOURS * 3600, show_spinner=False)
 def cached_prices(ticker: str, period: str) -> pd.DataFrame:
     return load_stock_data(ticker, period)
 
@@ -196,9 +197,19 @@ with tabs[0]:
     min_volume = filters[2].number_input("Minimum average volume", 0, value=500_000, step=100_000)
     min_market_cap = filters[3].number_input("Minimum market cap", 0, value=0, step=100_000_000)
     minimum_score = st.slider("Minimum score", 0, 100, 0)
-    full_scan = st.checkbox("Full scan mode", value=False,
-                            help="Large scans can take a long time and providers may rate-limit requests.")
+    options = st.columns(2)
+    full_scan = options[0].checkbox(
+        "Full scan mode",
+        value=False,
+        help="Large scans can take a long time and providers may rate-limit requests.",
+    )
+    resume_scan = options[1].checkbox(
+        "Resume previous scan results",
+        value=False,
+        help="Skip selected tickers already present in scanner_results.csv.",
+    )
     if st.button("Run market scan", type="primary", use_container_width=True):
+        scan_started = perf_counter()
         universe, universe_warnings = cached_universe(source, asset_type, include_otc)
         limit = len(universe) if scan_choice == "All" else int(scan_choice)
         if scan_choice == "All" and not full_scan:
@@ -207,14 +218,37 @@ with tabs[0]:
         selected = universe.head(limit)
         metadata = selected.set_index("ticker")[["asset_type", "exchange"]].to_dict("index")
         bar = st.progress(0, "Preparing scan")
+        resume_results = None
+        if resume_scan and SCANNER_RESULTS_FILE.exists():
+            try:
+                resume_results = pd.read_csv(SCANNER_RESULTS_FILE)
+            except Exception as error:
+                universe_warnings.append(f"Previous scan results could not be loaded: {error}")
 
         def progress(ticker: str, count: int) -> None:
             bar.progress(count / len(selected), f"{ticker}: {count}/{len(selected)}")
 
-        results, errors, analyses = scan_tickers(
-            selected["ticker"], period, cached_prices, cached_info, enable_ml,
-            progress, max_workers, metadata,
+        completed = set()
+        if resume_results is not None and "Ticker" in resume_results:
+            completed = set(resume_results["Ticker"].dropna().astype(str))
+        pending = [
+            ticker for ticker in selected["ticker"].tolist()
+            if ticker not in completed
+        ]
+        bar.progress(0, f"Loading price data for {len(pending)} tickers")
+        prefetched_prices = load_stock_data_batch(pending, period)
+
+        def scan_price_loader(ticker: str, scan_period: str) -> pd.DataFrame:
+            if ticker in prefetched_prices:
+                return prefetched_prices[ticker].copy()
+            return cached_prices(ticker, scan_period)
+
+        results, errors, analyses, summary = scan_tickers(
+            selected["ticker"], period, scan_price_loader, cached_info, enable_ml,
+            progress, max_workers, metadata, resume_results=resume_results,
+            return_summary=True,
         )
+        summary["scan_time_seconds"] = round(perf_counter() - scan_started, 2)
         if not results.empty:
             market_caps = {ticker: item["fundamentals"].get("market_cap")
                            for ticker, item in analyses.items()}
@@ -229,9 +263,17 @@ with tabs[0]:
             results["Rank"] = range(1, len(results) + 1)
         st.session_state.update(
             scan_results=results, scan_errors=errors, scan_analyses=analyses,
-            universe_warnings=universe_warnings,
+            scan_summary=summary, universe_warnings=universe_warnings,
         )
         bar.empty()
+    summary = st.session_state.get("scan_summary")
+    if summary:
+        summary_columns = st.columns(5)
+        summary_columns[0].metric("Requested", summary["total_tickers_requested"])
+        summary_columns[1].metric("Successful", summary["successful_tickers"])
+        summary_columns[2].metric("Failed", summary["failed_tickers"])
+        summary_columns[3].metric("Skipped", summary["skipped_tickers"])
+        summary_columns[4].metric("Scan time", f"{summary['scan_time_seconds']:.1f}s")
     results = st.session_state.get("scan_results", pd.DataFrame())
     if results.empty:
         st.info("Run a 50-symbol scan first to validate provider access and performance.")
@@ -243,8 +285,17 @@ with tabs[0]:
         st.warning(warning)
     errors = st.session_state.get("scan_errors", {})
     if errors:
+        failed_frame = pd.DataFrame(
+            [{"Ticker": ticker, "Error": error} for ticker, error in errors.items()]
+        )
+        st.download_button(
+            "Download failed tickers",
+            failed_frame.to_csv(index=False),
+            FAILED_TICKERS_FILE.name,
+            "text/csv",
+        )
         with st.expander(f"{len(errors)} symbols failed without stopping the scan"):
-            st.json(errors)
+            st.dataframe(failed_frame, hide_index=True, use_container_width=True)
 
 with tabs[1]:
     st.subheader("Best Chances")
@@ -268,6 +319,8 @@ with tabs[1]:
             st.markdown(f"### {title}")
             for row in frame.itertuples(index=False):
                 ticker = getattr(row, "Ticker")
+                if ticker not in analyses:
+                    continue
                 decision = analyses[ticker]["decision"]
                 with st.expander(f"{ticker} | {decision['final_signal']} | {decision['final_score']:.1f}"):
                     st.write("Why ranked:", " ".join(decision["strengths"]))

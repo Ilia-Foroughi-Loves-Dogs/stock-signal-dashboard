@@ -3,7 +3,11 @@
 import threading
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+import pandas as pd
 
 from scanner import scan_tickers
 
@@ -71,6 +75,59 @@ class ScannerTests(unittest.TestCase):
         self.assertNotIn("data", analyses["AAA"])
         self.assertNotIn("model", analyses["AAA"]["ml"])
         self.assertEqual(sorted(count for _, count in progress), [1, 2, 3])
+
+    def test_resume_skips_completed_tickers_and_returns_summary(self) -> None:
+        previous = pd.DataFrame([{
+            "Rank": 1,
+            "Ticker": "AAA",
+            "Final Score": 70.0,
+            "Quant Score": 70.0,
+            "Relative Volume": 1.2,
+        }])
+
+        with patch("scanner.analyze_ticker", return_value=_analysis("BBB", 80.0)) as analyze:
+            results, errors, analyses, summary = scan_tickers(
+                ["AAA", "BBB"],
+                resume_results=previous,
+                return_summary=True,
+                save_results=False,
+            )
+
+        analyze.assert_called_once()
+        self.assertEqual(analyze.call_args.args[0], "BBB")
+        self.assertEqual(results["Ticker"].tolist(), ["BBB", "AAA"])
+        self.assertEqual(errors, {})
+        self.assertEqual(set(analyses), {"BBB"})
+        self.assertEqual(summary["total_tickers_requested"], 2)
+        self.assertEqual(summary["successful_tickers"], 2)
+        self.assertEqual(summary["failed_tickers"], 0)
+        self.assertEqual(summary["skipped_tickers"], 1)
+
+    def test_more_than_100_failures_are_isolated_and_exported(self) -> None:
+        tickers = [f"FAIL{index}" for index in range(105)]
+
+        with TemporaryDirectory() as directory:
+            results_file = Path(directory) / "scanner_results.csv"
+            failed_file = Path(directory) / "failed_tickers.csv"
+            with (
+                patch("scanner.SCANNER_RESULTS_FILE", results_file),
+                patch("scanner.FAILED_TICKERS_FILE", failed_file),
+                patch("scanner.analyze_ticker", side_effect=ValueError("provider unavailable")),
+            ):
+                results, errors, analyses, summary = scan_tickers(
+                    tickers,
+                    max_workers=16,
+                    return_summary=True,
+                )
+
+            failed = pd.read_csv(failed_file)
+
+        self.assertTrue(results.empty)
+        self.assertEqual(len(errors), 105)
+        self.assertEqual(analyses, {})
+        self.assertEqual(len(failed), 105)
+        self.assertEqual(summary["successful_tickers"], 0)
+        self.assertEqual(summary["failed_tickers"], 105)
 
 
 if __name__ == "__main__":

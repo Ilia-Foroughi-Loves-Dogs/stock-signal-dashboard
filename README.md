@@ -14,7 +14,10 @@ rules, and records fake-money paper trades.
   active Alpaca assets when paper API credentials exist
 - Falls back to a built-in liquid stock and ETF list when online sources fail
 - Downloads daily OHLCV and best-effort fundamentals through `yfinance`
-- Caches data in Streamlit and in the local `cache/` directory
+- Caches price data for 24 hours in the local `cache/` directory
+- Prefetches uncached prices in batches, then analyzes tickers concurrently
+- Supports resumable scans, progress reporting, scan summaries, and isolated
+  `failed_tickers.csv` exports
 - Calculates trend, momentum, volume, volatility, drawdown, support/resistance,
   breakout, and fundamental features
 - Produces a transparent 0-100 quant score and watch-oriented labels
@@ -67,6 +70,8 @@ For a larger scan, choose 500 or 1,000. To request every discovered symbol,
 choose **All** and enable **Full scan mode**. Large scans can take a long time,
 consume substantial CPU/network capacity, and trigger provider rate limits.
 Failed symbols are isolated so the remaining scan continues.
+Enable **Resume previous scan results** to skip symbols already stored in
+`scanner_results.csv`.
 
 ## Workflow
 

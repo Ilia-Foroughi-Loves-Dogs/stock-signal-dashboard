@@ -10,5 +10,6 @@ paper_portfolio.csv
 models/
 cache/
 scanner_results.csv
+failed_tickers.csv
 .pytest_cache/
 .DS_Store
