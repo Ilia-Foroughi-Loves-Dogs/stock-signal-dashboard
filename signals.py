@@ -1,186 +1,191 @@
-"""Technical indicators, scoring, and plain-English signal explanations."""
+"""Transparent quant scoring, labels, exit alerts, and combined decisions."""
+
+from __future__ import annotations
 
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import MACD
-from ta.volatility import AverageTrueRange
 
-MIN_HISTORY_ROWS = 200
-
-
-def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
-    """Add all indicators used by the scanner and backtest."""
-    result = data.copy()
-    close = result["Close"]
-    result["Daily_Change_Pct"] = close.pct_change() * 100
-    result["SMA_20"] = close.rolling(20).mean()
-    result["SMA_50"] = close.rolling(50).mean()
-    result["SMA_200"] = close.rolling(200).mean()
-    result["RSI"] = RSIIndicator(close=close, window=14).rsi()
-
-    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
-    result["MACD"] = macd.macd()
-    result["MACD_Signal"] = macd.macd_signal()
-    result["Volume_Avg_20"] = result["Volume"].rolling(20).mean()
-    result["Relative_Volume"] = result["Volume"] / result["Volume_Avg_20"].replace(0, np.nan)
-    result["High_52W"] = close.rolling(252, min_periods=200).max()
-    result["Low_52W"] = close.rolling(252, min_periods=200).min()
-    result["Distance_From_52W_High_Pct"] = (close / result["High_52W"] - 1) * 100
-    result["Distance_From_52W_Low_Pct"] = (close / result["Low_52W"] - 1) * 100
-    result["Momentum_20D_Pct"] = close.pct_change(20) * 100
-    result["ATR"] = AverageTrueRange(
-        high=result["High"], low=result["Low"], close=close, window=14
-    ).average_true_range()
-    result["ATR_Pct"] = result["ATR"] / close * 100
-    result["Trend_Status"] = result.apply(trend_status, axis=1)
-    return result
+from config import SCORE_MAXIMUMS
+from indicators import add_indicators, latest_snapshot
+from risk import calculate_trade_levels
 
 
-def trend_status(row: pd.Series) -> str:
-    """Classify moving-average alignment."""
-    values = [row.get("Close"), row.get("SMA_50"), row.get("SMA_200")]
-    if any(pd.isna(value) for value in values):
-        return "Insufficient history"
-    if row["Close"] > row["SMA_50"] > row["SMA_200"]:
-        return "Bullish"
-    if row["Close"] < row["SMA_50"] < row["SMA_200"]:
-        return "Bearish"
-    return "Mixed"
-
-
-def score_row(row: pd.Series, history_rows: int = MIN_HISTORY_ROWS) -> tuple[int, dict[str, int]]:
-    """Score one trading day from 0 to 100 by category."""
-    close = float(row["Close"])
-    volume = float(row.get("Volume", 0) or 0)
-    scores = {"Trend": 0, "Momentum": 0, "Volume": 0, "Risk/Reward": 0, "Quality": 0}
-
-    scores["Trend"] += 10 if close > row.get("SMA_50", np.nan) else 0
-    scores["Trend"] += 10 if row.get("SMA_50", np.nan) > row.get("SMA_200", np.nan) else 0
-    scores["Trend"] += 10 if close > row.get("SMA_200", np.nan) else 0
-    scores["Momentum"] += 10 if row.get("MACD", np.nan) > row.get("MACD_Signal", np.nan) else 0
-    scores["Momentum"] += 8 if 45 <= row.get("RSI", np.nan) <= 65 else 0
-    scores["Momentum"] += 7 if row.get("Momentum_20D_Pct", np.nan) > 0 else 0
-    scores["Volume"] += 8 if row.get("Relative_Volume", 0) > 1 else 0
-    scores["Volume"] += 7 if volume > row.get("Volume_Avg_20", np.inf) else 0
-
-    distance_high = row.get("Distance_From_52W_High_Pct", np.nan)
-    scores["Risk/Reward"] += 7 if pd.notna(distance_high) and -30 <= distance_high <= -3 else 0
-    scores["Risk/Reward"] += 4 if close >= row.get("SMA_50", np.inf) else 0
-    scores["Risk/Reward"] += 4 if close >= row.get("SMA_200", np.inf) else 0
-    scores["Risk/Reward"] += 5 if 0 < row.get("ATR_Pct", np.inf) <= 5 else 0
-    scores["Quality"] += 5 if volume >= 500_000 else 0
-    scores["Quality"] += 5 if history_rows >= MIN_HISTORY_ROWS else 0
-    return int(sum(scores.values())), scores
-
-
-def signal_from_score(score: int) -> str:
-    """Map the score to a watch-oriented label."""
+def signal_from_score(score: float) -> str:
+    if score >= 90:
+        return "Elite Buy Watch"
     if score >= 80:
         return "Strong Buy Watch"
     if score >= 65:
         return "Buy Watch"
     if score >= 45:
-        return "Hold / Neutral"
-    if score >= 25:
+        return "Neutral / Wait"
+    if score >= 30:
         return "Weak / Avoid"
-    return "Sell / Avoid"
+    return "Sell / Exit Watch"
 
 
-def _trade_levels(row: pd.Series) -> tuple[float, float, float]:
-    """Create educational stop and target ideas from current volatility."""
-    price = float(row["Close"])
-    atr = float(row["ATR"])
-    stop_candidates = [price - 2 * atr]
-    sma_50 = row.get("SMA_50")
-    if pd.notna(sma_50) and sma_50 < price:
-        stop_candidates.append(float(sma_50) * 0.98)
-    eligible_stops = [value for value in stop_candidates if value < price]
-    stop = max(0.01, max(eligible_stops))
-    risk = max(price - stop, atr)
-    return stop, price + 2 * risk, price + 3 * risk
+def _known(value: Any) -> bool:
+    return value is not None and pd.notna(value)
 
 
-def explain_signal(row: pd.Series, score: int) -> dict[str, Any]:
-    """Build concise strengths, risks, invalidation, stop, and target text."""
-    strengths: list[str] = []
-    risks: list[str] = []
-    if row["Close"] > row["SMA_50"] > row["SMA_200"]:
-        strengths.append("Price and moving averages are aligned in a bullish trend.")
-    elif row["Close"] > row["SMA_200"]:
-        strengths.append("Price remains above its long-term 200-day average.")
-    else:
-        risks.append("Price is below its 200-day average, weakening the long-term setup.")
-    if row["MACD"] > row["MACD_Signal"]:
-        strengths.append("MACD is above its signal line, showing positive momentum.")
-    else:
-        risks.append("MACD momentum is below its signal line.")
-    if 45 <= row["RSI"] <= 65:
-        strengths.append("RSI is in the preferred balanced momentum range.")
-    elif row["RSI"] > 70:
-        risks.append("RSI is above 70, so the move may be extended.")
-    else:
-        risks.append("RSI is outside the preferred 45 to 65 range.")
-    if row["Relative_Volume"] > 1:
-        strengths.append("Trading volume is above its 20-day average.")
-    else:
-        risks.append("Relative volume is below average, so participation is limited.")
-    if row["ATR_Pct"] > 5:
-        risks.append("ATR is above 5% of price, indicating elevated volatility.")
-    if row["Distance_From_52W_High_Pct"] > -3:
-        risks.append("Price is within 3% of its 52-week high, which can limit near-term reward.")
+def fundamental_score(fundamentals: dict[str, Any] | None) -> int:
+    info = fundamentals or {}
+    score = 0
+    if _known(info.get("revenue_growth")) and info["revenue_growth"] > 0:
+        score += 3
+    if _known(info.get("profit_margins")) and info["profit_margins"] > 0:
+        score += 3
+    pe = info.get("forward_pe") or info.get("pe_ratio")
+    if _known(pe) and 0 < pe <= 40:
+        score += 2
+    average_volume = info.get("average_volume")
+    if not _known(average_volume) or average_volume >= 500_000:
+        score += 2
+    return score
 
-    stop, target_low, target_high = _trade_levels(row)
+
+def score_row(
+    row: pd.Series, fundamentals: dict[str, Any] | None = None
+) -> tuple[int, dict[str, int]]:
+    price = float(row["Price"])
+    levels = calculate_trade_levels(row)
+    scores = {name: 0 for name in SCORE_MAXIMUMS}
+
+    scores["Trend"] += 6 if price > row.get("SMA_20", np.inf) else 0
+    scores["Trend"] += 6 if price > row.get("SMA_50", np.inf) else 0
+    scores["Trend"] += 6 if price > row.get("SMA_200", np.inf) else 0
+    scores["Trend"] += 6 if row.get("SMA_50", 0) > row.get("SMA_200", np.inf) else 0
+    scores["Trend"] += 6 if row.get("EMA_9", 0) > row.get("EMA_21", np.inf) else 0
+
+    scores["Momentum"] += 5 if 45 <= row.get("RSI", np.nan) <= 65 else 0
+    scores["Momentum"] += 5 if row.get("MACD", 0) > row.get("MACD_Signal", np.inf) else 0
+    scores["Momentum"] += 5 if bool(row.get("MACD_Hist_Improving", False)) else 0
+    scores["Momentum"] += 5 if row.get("Return_20D_Pct", -np.inf) > 0 else 0
+    scores["Momentum"] += 5 if row.get("Return_50D_Pct", -np.inf) > 0 else 0
+
+    scores["Volume"] += 5 if row.get("Relative_Volume", 0) > 1 else 0
+    scores["Volume"] += 5 if row.get("Volume", 0) > row.get("Volume_Avg_20", np.inf) else 0
+    scores["Volume"] += 5 if bool(row.get("Volume_Confirms", False)) else 0
+
+    atr_pct = row.get("ATR_Pct", np.inf)
+    distance_high = row.get("Distance_From_52W_High_Pct", np.nan)
+    scores["Risk/Reward"] += 5 if 0 < atr_pct <= 5 else 0
+    scores["Risk/Reward"] += 5 if pd.notna(distance_high) and -25 <= distance_high <= -2 else 0
+    scores["Risk/Reward"] += 5 if levels["stop_loss"] < price and levels["risk_per_share"] / price <= 0.1 else 0
+    scores["Risk/Reward"] += 5 if levels["risk_reward_ratio"] >= 2 else 0
+    scores["Fundamental/Quality"] = fundamental_score(fundamentals)
+    return int(sum(scores.values())), scores
+
+
+def exit_alerts(data: pd.DataFrame, row: pd.Series, score: float) -> list[str]:
+    alerts: list[str] = []
+    previous = data.iloc[-2] if len(data) > 1 else row
+    levels = calculate_trade_levels(row)
+    if row["Price"] < row.get("SMA_50", -np.inf):
+        alerts.append("Price closed below the 50-day SMA.")
+    if previous.get("MACD", 0) >= previous.get("MACD_Signal", 0) and row.get("MACD", 0) < row.get("MACD_Signal", 0):
+        alerts.append("MACD crossed below its signal line.")
+    if previous.get("RSI", 0) >= 40 and row.get("RSI", 100) < 40:
+        alerts.append("RSI fell below 40 after previously holding above it.")
+    if row["Price"] < row.get("Support", -np.inf):
+        alerts.append("Price broke the estimated 20-day support.")
+    if row["Price"] <= levels["stop_loss"]:
+        alerts.append("The volatility-based stop-loss zone was reached.")
+    if score < 45:
+        alerts.append("Quant score dropped below 45.")
+    if row.get("RSI", 0) > 70 and not bool(row.get("MACD_Hist_Improving", True)):
+        alerts.append("Price is overextended while momentum is weakening.")
+    return alerts
+
+
+def get_latest_signal(
+    data: pd.DataFrame, fundamentals: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    analyzed = data if "SMA_200" in data else add_indicators(data)
+    row = latest_snapshot(analyzed)
+    score, categories = score_row(row, fundamentals)
+    levels = calculate_trade_levels(row)
+    alerts = exit_alerts(analyzed.loc[: row.name], row, score)
+    strengths = []
+    if row["Price"] > row.get("SMA_50", np.inf):
+        strengths.append("Price is above its 50-day trend average.")
+    if row.get("EMA_9", 0) > row.get("EMA_21", np.inf):
+        strengths.append("Short-term EMA alignment is positive.")
+    if row.get("MACD", 0) > row.get("MACD_Signal", np.inf):
+        strengths.append("MACD momentum is positive.")
+    if row.get("Relative_Volume", 0) > 1:
+        strengths.append("Volume is above its 20-day average.")
+    risks = alerts.copy()
+    if row.get("ATR_Pct", 0) > 5:
+        risks.append("ATR indicates unusually high volatility.")
+    if row.get("Distance_From_52W_High_Pct", -100) > -2:
+        risks.append("Price is very close to its 52-week high and may be extended.")
     return {
-        "summary": f"{signal_from_score(score)} with a {score}/100 technical score.",
-        "strengths": strengths or ["No major scoring strengths are currently confirmed."],
-        "risks": risks or ["No exceptional technical risk flag is present; market risk still applies."],
-        "invalidation": (
-            f"A close below ${stop:,.2f}, especially with weakness below the 50-day SMA, "
-            "would invalidate this watch setup."
-        ),
-        "stop_loss": stop,
-        "take_profit_low": target_low,
-        "take_profit_high": target_high,
-    }
-
-
-def get_latest_signal(data: pd.DataFrame) -> dict[str, Any]:
-    """Return latest indicators, score, label, and explanation."""
-    needed = [
-        "Close", "SMA_20", "SMA_50", "SMA_200", "RSI", "MACD", "MACD_Signal",
-        "ATR", "High_52W", "Low_52W",
-    ]
-    complete = data.dropna(subset=needed)
-    if complete.empty:
-        raise ValueError("At least 200 trading days are needed to calculate this signal.")
-    latest = complete.iloc[-1]
-    score, categories = score_row(latest, len(data))
-    explanation = explain_signal(latest, score)
-    return {
-        "date": complete.index[-1],
-        "price": float(latest["Close"]),
-        "daily_change_pct": float(latest["Daily_Change_Pct"]),
+        "date": row.name,
+        "price": float(row["Price"]),
+        "daily_change_pct": float(row["Daily_Change_Pct"]),
+        "return_5d": float(row["Return_5D_Pct"]),
+        "return_20d": float(row["Return_20D_Pct"]),
+        "return_50d": float(row["Return_50D_Pct"]),
+        "quant_score": score,
         "score": score,
         "signal": signal_from_score(score),
         "category_scores": categories,
-        "trend_status": latest["Trend_Status"],
-        "sma_20": float(latest["SMA_20"]),
-        "sma_50": float(latest["SMA_50"]),
-        "sma_200": float(latest["SMA_200"]),
-        "rsi": float(latest["RSI"]),
-        "macd": float(latest["MACD"]),
-        "macd_signal": float(latest["MACD_Signal"]),
-        "volume": int(latest["Volume"]),
-        "volume_avg_20": float(latest["Volume_Avg_20"]),
-        "relative_volume": float(latest["Relative_Volume"]),
-        "high_52w": float(latest["High_52W"]),
-        "low_52w": float(latest["Low_52W"]),
-        "distance_high_pct": float(latest["Distance_From_52W_High_Pct"]),
-        "distance_low_pct": float(latest["Distance_From_52W_Low_Pct"]),
-        "atr": float(latest["ATR"]),
-        "atr_pct": float(latest["ATR_Pct"]),
-        **explanation,
+        "trend": str(row["Trend"]),
+        "sma_20": float(row["SMA_20"]),
+        "sma_50": float(row["SMA_50"]),
+        "sma_100": float(row["SMA_100"]),
+        "sma_200": float(row["SMA_200"]),
+        "ema_9": float(row["EMA_9"]),
+        "ema_21": float(row["EMA_21"]),
+        "rsi": float(row["RSI"]),
+        "macd": float(row["MACD"]),
+        "macd_signal": float(row["MACD_Signal"]),
+        "macd_hist": float(row["MACD_Hist"]),
+        "relative_volume": float(row["Relative_Volume"]),
+        "volume": int(row["Volume"]),
+        "volume_avg_20": float(row["Volume_Avg_20"]),
+        "atr": float(row["ATR"]),
+        "atr_pct": float(row["ATR_Pct"]),
+        "volatility": float(row["Volatility_20D_Pct"]),
+        "trend_strength": float(row["Trend_Strength"]),
+        "high_52w": float(row["High_52W"]),
+        "low_52w": float(row["Low_52W"]),
+        "distance_high_pct": float(row["Distance_From_52W_High_Pct"]),
+        "distance_low_pct": float(row["Distance_From_52W_Low_Pct"]),
+        "support": float(row["Support"]),
+        "resistance": float(row["Resistance"]),
+        "strengths": strengths or ["No major bullish factor is confirmed."],
+        "risks": risks or ["No exceptional technical warning is active; normal market risk remains."],
+        "exit_alerts": alerts,
+        **levels,
+    }
+
+
+def combined_decision(
+    signal: dict[str, Any],
+    probability_up: float | None,
+    fundamentals: dict[str, Any] | None,
+) -> dict[str, Any]:
+    ml_component = 50.0 if probability_up is None else probability_up * 100
+    rr_component = min(signal["risk_reward_ratio"] / 3, 1) * 100
+    fundamental_component = fundamental_score(fundamentals) * 10
+    final = (
+        signal["quant_score"] * 0.50
+        + ml_component * 0.25
+        + rr_component * 0.15
+        + fundamental_component * 0.10
+    )
+    final = round(float(np.clip(final, 0, 100)), 1)
+    confidence = round(min(95.0, 45 + abs(final - 50) * 0.8), 1)
+    return {
+        **signal,
+        "final_score": final,
+        "final_signal": signal_from_score(final),
+        "confidence": confidence,
+        "probability_up_10d": None if probability_up is None else probability_up,
+        "probability_down_10d": None if probability_up is None else 1 - probability_up,
+        "fundamental_score": fundamental_score(fundamentals),
     }

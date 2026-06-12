@@ -1,8 +1,12 @@
-streamlit
-pandas
-numpy
-yfinance
-plotly
-ta
-python-dotenv
-requests
+streamlit>=1.40
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.54
+plotly>=5.24
+ta>=0.11
+scikit-learn>=1.5
+joblib>=1.4
+requests>=2.32
+python-dotenv>=1.0
+openai>=1.60
+# alpaca-py is intentionally omitted. External broker trading is disabled.

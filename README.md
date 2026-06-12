@@ -1,35 +1,38 @@
-# Stock Signal Dashboard
+# AI Quant Scanner & Paper Trading Assistant
 
-Stock Signal Dashboard is an educational Streamlit stock scanner and paper
-trading assistant. It downloads daily market data, calculates common technical
-indicators, ranks a stock universe with a transparent 0-100 score, backtests the
-same score, records simulated trades locally, and can optionally submit orders
-to an Alpaca paper account.
+An educational Streamlit dashboard that scans stocks, calculates transparent
+technical and quality scores, trains an advisory machine-learning model,
+explains setups in plain English, backtests the rules, and tracks fake-money
+paper trades.
 
-> **Warning:** This project is educational software, not financial advice. It
-> does not predict returns and cannot place real trades. Market data may be
-> delayed, incomplete, or unavailable.
+> **Educational software only. This is not financial advice. No result,
+> probability, score, backtest, or AI explanation guarantees a profit. Real
+> broker connectivity and real-money trading are disabled.**
 
 ## Features
 
-- Scan the built-in 21-stock/ETF universe or comma-separated custom tickers
-- Handle bad tickers, missing history, and provider errors without stopping a scan
-- Calculate price change, SMA 20/50/200, RSI, MACD, volume, relative volume,
-  52-week range, ATR, momentum, and trend alignment
-- Rank setups using a category-based score from 0 to 100
-- Explain strengths, risks, invalidation, ATR-based stop ideas, and target zones
-- Chart price, moving averages, RSI, MACD, and recent indicators
-- Backtest score 80+ entries and exits below 45 against buy-and-hold
-- Track fake cash, positions, cost basis, and paper profit/loss
-- Store simulated orders in a local `paper_trades.csv` ledger
-- Optionally show Alpaca paper balances and open positions
-- Submit confirmed buy/sell market orders to Alpaca paper trading
-- Reject live Alpaca URLs in the broker client
-- Keep every real brokerage action hard disabled
+- Large built-in US stock and ETF universe plus custom comma-separated tickers
+- Daily OHLC, adjusted close, volume, company profile, valuation, growth,
+  margins, leverage, beta, sector, and industry when Yahoo Finance provides them
+- SMA 20/50/100/200, EMA 9/21, RSI, MACD, Bollinger Bands, ATR, relative volume,
+  52-week range, volatility, ADX trend strength, support, and resistance
+- Transparent 0-100 quant score with trend, momentum, volume, risk/reward, and
+  fundamental/quality sections
+- Watch-oriented labels: Elite Buy Watch, Strong Buy Watch, Buy Watch,
+  Neutral / Wait, Weak / Avoid, and Sell / Exit Watch
+- Explicit exit alerts for trend breaks, MACD crosses, weak RSI, support breaks,
+  stop zones, low scores, and weakening extended moves
+- Random Forest probability for whether price is higher ten sessions later,
+  evaluated with time-ordered walk-forward splits
+- Combined decision: 50% quant, 25% ML, 15% risk/reward, 10% fundamentals
+- Optional OpenAI structured explanation with a deterministic local fallback
+- Risk-sized backtest against buy-and-hold with an equity curve and trade log
+- Local fake-money portfolio, P/L, and trade history in CSV files
+- Disabled broker module that always rejects order placement
 
 ## Install
 
-Python 3.10 or newer is recommended.
+Python 3.10 through 3.13 is recommended.
 
 ```bash
 python3 -m venv .venv
@@ -38,116 +41,93 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Windows PowerShell activation:
+Optional OpenAI explanations use a local `.env` file:
 
-```powershell
-.venv\Scripts\Activate.ps1
+```bash
+OPENAI_API_KEY=your_key
+OPENAI_MODEL=gpt-4.1-mini
 ```
+
+The API key is optional. Without it, the app uses the local rule-based engine.
 
 ## Run
 
 ```bash
+source .venv/bin/activate
 python -m streamlit run app.py
 ```
 
-Open the local URL printed by Streamlit, normally
+Then open the local address printed by Streamlit, normally
 `http://localhost:8501`.
+
+## Tabs
+
+1. **AI Market Scanner** ranks the universe and provides score, liquidity,
+   sector, trend, ML probability, stop, target, and risk/reward filters.
+2. **Single Stock Deep Analysis** charts price, averages, support/resistance,
+   RSI, MACD, volume, score sections, fundamentals, and AI explanations.
+3. **AI Buy/Sell Brain** presents top setups, weak/exit setups, attractive
+   risk/reward candidates, and overextended warnings.
+4. **Backtest** applies score-based entries and risk-sized exits to fake cash.
+5. **Paper Trading** records confirmed simulated buys and sells locally.
+6. **Risk Manager** calculates risk budget, maximum shares, allocation, ATR/SMA
+   stop ideas, and 2:1 or 3:1 targets.
+7. **Settings** reports provider, optional AI, storage, and broker status.
 
 ## Scoring
 
-The score has five categories:
-
-| Category | Maximum | Main checks |
+| Section | Points | Examples |
 | --- | ---: | --- |
-| Trend | 30 | Price above SMA 50, SMA 50 above SMA 200, price above SMA 200 |
-| Momentum | 25 | MACD above signal, RSI 45-65, positive 20-day momentum |
-| Volume | 15 | Relative volume above 1.0 and volume above its 20-day average |
-| Risk/reward | 20 | Room below the 52-week high, major averages hold, moderate ATR |
-| Quality/liquidity | 10 | At least 500,000 shares of volume and enough history |
+| Trend | 30 | Price above key SMAs, golden-cross alignment, EMA 9 above EMA 21 |
+| Momentum | 25 | Balanced RSI, positive MACD, improving histogram, positive returns |
+| Volume | 15 | Relative volume and participation confirm movement |
+| Risk/reward | 20 | Moderate ATR, not extended, clear stop, at least 2:1 target |
+| Fundamental/quality | 10 | Growth, margins, valuation, and liquidity when available |
 
-Labels intentionally use watch-list language:
+The final score combines the quant score (50%), ML probability (25%),
+risk/reward (15%), and fundamental score (10%). Missing ML data is treated as
+neutral. The ML model never decides a paper trade by itself.
 
-- 80-100: **Strong Buy Watch**
-- 65-79: **Buy Watch**
-- 45-64: **Hold / Neutral**
-- 25-44: **Weak / Avoid**
-- 0-24: **Sell / Avoid**
+## Machine Learning
 
-A high score is not a guarantee or an instruction to buy.
-
-## Backtest
-
-The backtest starts with $10,000 in fake cash. It buys with the available cash
-when the daily score is at least 80 and sells the position when the score falls
-below 45. Fractional shares are allowed.
-
-Results include final value, return, maximum drawdown, order count, closed-trade
-win rate when available, and a buy-and-hold comparison. The model ignores fees,
-slippage, taxes, dividends, intraday execution, and liquidity constraints.
-Those omissions can materially overstate real-world results.
+`ml_model.py` creates indicator features and labels each historical row based on
+whether adjusted price is higher ten trading days later. A
+`RandomForestClassifier` is evaluated with expanding, time-ordered splits and
+then trained on all eligible historical rows for the current probability.
+Displayed accuracy is historical classification accuracy, not profitability.
 
 ## Paper Trading
 
-The Paper Trading tab offers two modes:
+Paper orders use the latest downloaded daily close and require an explicit
+confirmation checkbox. Trades are stored in `paper_trades.csv`; the reconstructed
+portfolio is stored in `paper_portfolio.csv`. Both are local runtime files and
+are ignored by Git. There is no broker API call.
 
-- **Local CSV:** records simulated buys and sells at the latest downloaded daily
-  close. It validates available fake cash and shares before adding an order to
-  `paper_trades.csv`.
-- **Alpaca Paper:** displays the paper account's cash, buying power, equity, and
-  open positions. It can submit buy or sell market orders using a dollar amount.
+`broker.py` intentionally contains only disabled placeholders. `place_order()`
+always raises:
 
-Both modes show a separate confirmation panel before every order. Reviewing an
-order does not submit it. The confirmation checkbox and **Confirm Paper Order**
-button are required before the CSV ledger is updated or Alpaca is called.
-
-The local starting cash setting is the CSV ledger's assumed opening balance, so
-changing it changes the displayed local account calculation. The CSV is runtime
-data and is ignored by Git. Delete it only when you intentionally want to reset
-the local paper account.
-
-## Alpaca Paper Setup
-
-1. Create or select an Alpaca paper account and generate its paper API keys.
-2. Copy `.env.example` to `.env`.
-3. Set these values with paper credentials:
-
-```bash
-ALPACA_API_KEY=your_paper_api_key
-ALPACA_SECRET_KEY=your_paper_secret_key
-ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+```text
+Real trading is disabled. This app only supports paper trading right now.
 ```
 
-4. Restart Streamlit, open **Paper Trading**, and select **Alpaca Paper**.
+A future integration may support Alpaca **paper trading only**, but it must
+remain opt-in, visibly simulated, and isolated from all live endpoints.
 
-Only `https://paper-api.alpaca.markets` is accepted. The live URL
-`https://api.alpaca.markets`, alternate hosts, HTTP URLs, ports, paths, query
-strings, and embedded credentials are rejected before any request is made.
-Generic `place_order()` calls remain hard disabled.
+## Limitations
 
-Alpaca paper trading is still a simulation and can differ from live execution.
-See Alpaca's [paper trading documentation](https://docs.alpaca.markets/docs/paper-trading).
-Never commit `.env`, API keys, or brokerage secrets.
-
-## Project Structure
-
-- `app.py`: Streamlit UI and charts
-- `config.py`: shared defaults and paths
-- `data.py`: ticker validation and yfinance downloads
-- `signals.py`: indicators, scoring, labels, and explanations
-- `scanner.py`: multi-ticker ranking with per-symbol error isolation
-- `backtest.py`: score strategy and buy-and-hold comparison
-- `paper_trading.py`: local CSV paper ledger and portfolio calculations
-- `broker.py`: strict paper-only Alpaca client and live-URL safeguards
-- `test_broker.py`: paper endpoint and confirmation safety tests
-
-## Screenshots
-
-Add scanner, single-stock, backtest, and paper-portfolio screenshots here.
+- Yahoo Finance data can be delayed, missing, rate-limited, or revised.
+- Fundamentals are incomplete for many ETFs and some stocks.
+- Scanning the full universe with ML enabled can take several minutes.
+- Models can overfit and market regimes change.
+- Backtests omit slippage, commissions, taxes, dividends, liquidity limits,
+  survivorship bias, and realistic intraday stop execution.
+- Daily-close paper fills are simplified and are not representative of live
+  execution.
+- Support, resistance, stops, targets, and confidence are heuristics.
 
 ## Disclaimer
 
-This software is provided for learning and experimentation. Technical indicators
-use historical market data and can produce false or late signals. Nothing in the
-application considers your objectives, finances, taxes, time horizon, or risk
-tolerance. Verify all data independently and consult a qualified professional
-before making financial decisions.
+Use this project for learning and experimentation only. It does not consider
+your objectives, finances, tax situation, time horizon, or risk tolerance.
+Verify market data independently and consult a qualified professional before
+making financial decisions.

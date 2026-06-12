@@ -1,4 +1,12 @@
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+paper_trades.csv
+paper_portfolio.csv
+models/
+.pytest_cache/
+.DS_Store
