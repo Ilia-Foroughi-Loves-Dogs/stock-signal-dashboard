@@ -8,5 +8,7 @@ __pycache__/
 paper_trades.csv
 paper_portfolio.csv
 models/
+cache/
+scanner_results.csv
 .pytest_cache/
 .DS_Store

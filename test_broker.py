@@ -16,7 +16,7 @@ class BrokerSafetyTests(unittest.TestCase):
     def test_place_order_always_raises_required_message(self) -> None:
         with self.assertRaisesRegex(
             RuntimeError,
-            "Real trading is disabled. This app only supports paper trading right now.",
+            "Real trading is disabled. This app only supports paper trading.",
         ):
             place_order("AAPL", "BUY", 100)
 

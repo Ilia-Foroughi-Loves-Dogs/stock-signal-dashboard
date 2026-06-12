@@ -9,4 +9,6 @@ joblib>=1.4
 requests>=2.32
 python-dotenv>=1.0
 openai>=1.60
+beautifulsoup4>=4.12
+lxml>=5.3
 # alpaca-py is intentionally omitted. External broker trading is disabled.

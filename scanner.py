@@ -11,6 +11,8 @@ from data import load_company_info, load_stock_data
 from indicators import add_indicators
 from ml_model import train_model
 from signals import combined_decision, get_latest_signal
+from config import SCANNER_RESULTS_FILE
+from risk import risk_warnings
 
 
 def analyze_ticker(
@@ -19,6 +21,7 @@ def analyze_ticker(
     price_loader: Callable[[str, str], pd.DataFrame] = load_stock_data,
     info_loader: Callable[[str], dict] = load_company_info,
     run_ml: bool = True,
+    metadata: dict | None = None,
 ) -> dict:
     prices = add_indicators(price_loader(ticker, period))
     fundamentals = info_loader(ticker)
@@ -34,6 +37,7 @@ def analyze_ticker(
         "signal": signal,
         "ml": ml,
         "decision": decision,
+        "metadata": metadata or {},
     }
 
 
@@ -41,16 +45,23 @@ def _result_row(ticker: str, analysis: dict) -> dict:
     decision = analysis["decision"]
     info = analysis["fundamentals"]
     probability = decision["probability_up_10d"]
+    metadata = analysis.get("metadata", {})
+    warnings = risk_warnings(
+        decision["final_score"], decision.get("atr_pct", 0),
+        average_volume=decision["volume_avg_20"],
+    )
     return {
         "Ticker": ticker,
         "Company": info.get("company_name", ticker),
+        "Asset Type": metadata.get("asset_type", "Unknown"),
+        "Exchange": metadata.get("exchange", "Unknown"),
         "Sector": info.get("sector", "Unknown"),
         "Latest Price": decision["price"],
         "Daily %": decision["daily_change_pct"],
         "Signal": decision["final_signal"],
         "Final Score": decision["final_score"],
         "Quant Score": decision["quant_score"],
-        "ML Probability Up": None if probability is None else probability * 100,
+        "ML Probability Up 10D": None if probability is None else probability * 100,
         "RSI": decision["rsi"],
         "Relative Volume": decision["relative_volume"],
         "Average Volume": decision["volume_avg_20"],
@@ -58,6 +69,8 @@ def _result_row(ticker: str, analysis: dict) -> dict:
         "Stop-Loss Idea": decision["stop_loss"],
         "Take-Profit Idea": decision["take_profit_2r"],
         "Risk/Reward": decision["risk_reward_ratio"],
+        "ATR %": decision.get("atr_pct"),
+        "Warning": "; ".join(warnings),
     }
 
 
@@ -74,6 +87,7 @@ def _lightweight_analysis(analysis: dict) -> dict:
         "signal": analysis["signal"],
         "ml": ml,
         "decision": analysis["decision"],
+        "metadata": analysis.get("metadata", {}),
     }
 
 
@@ -85,6 +99,8 @@ def scan_tickers(
     run_ml: bool = True,
     progress_callback: Callable[[str, int], None] | None = None,
     max_workers: int = 8,
+    metadata: dict[str, dict] | None = None,
+    save_results: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, str], dict[str, dict]]:
     symbols = list(dict.fromkeys(tickers))
     if not symbols:
@@ -105,6 +121,7 @@ def scan_tickers(
                 price_loader,
                 info_loader,
                 run_ml,
+                (metadata or {}).get(ticker),
             ): ticker
             for ticker in symbols
         }
@@ -127,4 +144,6 @@ def scan_tickers(
             ascending=[False, False, False],
         ).reset_index(drop=True)
         result.insert(0, "Rank", range(1, len(result) + 1))
+        if save_results:
+            result.to_csv(SCANNER_RESULTS_FILE, index=False)
     return result, errors, analyses

@@ -57,17 +57,18 @@ def score_row(
     scores["Trend"] += 6 if price > row.get("SMA_50", np.inf) else 0
     scores["Trend"] += 6 if price > row.get("SMA_200", np.inf) else 0
     scores["Trend"] += 6 if row.get("SMA_50", 0) > row.get("SMA_200", np.inf) else 0
-    scores["Trend"] += 6 if row.get("EMA_9", 0) > row.get("EMA_21", np.inf) else 0
+    scores["Trend"] += 4 if row.get("EMA_9", 0) > row.get("EMA_21", np.inf) else 0
+    scores["Trend"] += 2 if row.get("Trend_Strength", 0) >= 20 else 0
 
-    scores["Momentum"] += 5 if 45 <= row.get("RSI", np.nan) <= 65 else 0
-    scores["Momentum"] += 5 if row.get("MACD", 0) > row.get("MACD_Signal", np.inf) else 0
-    scores["Momentum"] += 5 if bool(row.get("MACD_Hist_Improving", False)) else 0
-    scores["Momentum"] += 5 if row.get("Return_20D_Pct", -np.inf) > 0 else 0
-    scores["Momentum"] += 5 if row.get("Return_50D_Pct", -np.inf) > 0 else 0
+    scores["Momentum"] += 4 if 45 <= row.get("RSI", np.nan) <= 65 else 0
+    scores["Momentum"] += 4 if row.get("MACD", 0) > row.get("MACD_Signal", np.inf) else 0
+    scores["Momentum"] += 4 if bool(row.get("MACD_Hist_Improving", False)) else 0
+    scores["Momentum"] += 4 if row.get("Return_20D_Pct", -np.inf) > 0 else 0
+    scores["Momentum"] += 4 if row.get("Return_50D_Pct", -np.inf) > 0 else 0
 
-    scores["Volume"] += 5 if row.get("Relative_Volume", 0) > 1 else 0
-    scores["Volume"] += 5 if row.get("Volume", 0) > row.get("Volume_Avg_20", np.inf) else 0
-    scores["Volume"] += 5 if bool(row.get("Volume_Confirms", False)) else 0
+    scores["Volume"] += 4 if row.get("Relative_Volume", 0) > 1 else 0
+    scores["Volume"] += 3 if bool(row.get("Volume_Confirms", False)) else 0
+    scores["Volume"] += 3 if row.get("Volume_Avg_20", 0) >= 500_000 else 0
 
     atr_pct = row.get("ATR_Pct", np.inf)
     distance_high = row.get("Distance_From_52W_High_Pct", np.nan)
@@ -85,6 +86,8 @@ def exit_alerts(data: pd.DataFrame, row: pd.Series, score: float) -> list[str]:
     levels = calculate_trade_levels(row)
     if row["Price"] < row.get("SMA_50", -np.inf):
         alerts.append("Price closed below the 50-day SMA.")
+    if row["Price"] < row.get("SMA_200", -np.inf):
+        alerts.append("Price closed below the 200-day SMA.")
     if previous.get("MACD", 0) >= previous.get("MACD_Signal", 0) and row.get("MACD", 0) < row.get("MACD_Signal", 0):
         alerts.append("MACD crossed below its signal line.")
     if previous.get("RSI", 0) >= 40 and row.get("RSI", 100) < 40:
@@ -95,6 +98,8 @@ def exit_alerts(data: pd.DataFrame, row: pd.Series, score: float) -> list[str]:
         alerts.append("The volatility-based stop-loss zone was reached.")
     if score < 45:
         alerts.append("Quant score dropped below 45.")
+    if levels["risk_reward_ratio"] < 1:
+        alerts.append("Estimated reward/risk deteriorated below 1:1.")
     if row.get("RSI", 0) > 70 and not bool(row.get("MACD_Hist_Improving", True)):
         alerts.append("Price is overextended while momentum is weakening.")
     return alerts
@@ -127,6 +132,7 @@ def get_latest_signal(
         "price": float(row["Price"]),
         "daily_change_pct": float(row["Daily_Change_Pct"]),
         "return_5d": float(row["Return_5D_Pct"]),
+        "return_10d": float(row["Return_10D_Pct"]),
         "return_20d": float(row["Return_20D_Pct"]),
         "return_50d": float(row["Return_50D_Pct"]),
         "quant_score": score,
@@ -140,16 +146,23 @@ def get_latest_signal(
         "sma_200": float(row["SMA_200"]),
         "ema_9": float(row["EMA_9"]),
         "ema_21": float(row["EMA_21"]),
+        "ema_50": float(row["EMA_50"]),
         "rsi": float(row["RSI"]),
         "macd": float(row["MACD"]),
         "macd_signal": float(row["MACD_Signal"]),
         "macd_hist": float(row["MACD_Hist"]),
+        "stochastic": float(row["Stochastic"]),
+        "roc": float(row["ROC"]),
         "relative_volume": float(row["Relative_Volume"]),
         "volume": int(row["Volume"]),
         "volume_avg_20": float(row["Volume_Avg_20"]),
+        "volume_avg_50": float(row["Volume_Avg_50"]),
+        "volume_trend": float(row["Volume_Trend"]),
         "atr": float(row["ATR"]),
         "atr_pct": float(row["ATR_Pct"]),
         "volatility": float(row["Volatility_20D_Pct"]),
+        "max_drawdown": float(row["Max_Drawdown_Pct"]),
+        "gap_risk": float(row["Gap_Risk_Pct"]),
         "trend_strength": float(row["Trend_Strength"]),
         "high_52w": float(row["High_52W"]),
         "low_52w": float(row["Low_52W"]),
@@ -157,6 +170,8 @@ def get_latest_signal(
         "distance_low_pct": float(row["Distance_From_52W_Low_Pct"]),
         "support": float(row["Support"]),
         "resistance": float(row["Resistance"]),
+        "breakout_level": float(row["Breakout_Level"]),
+        "breakdown_level": float(row["Breakdown_Level"]),
         "strengths": strengths or ["No major bullish factor is confirmed."],
         "risks": risks or ["No exceptional technical warning is active; normal market risk remains."],
         "exit_alerts": alerts,
@@ -169,15 +184,10 @@ def combined_decision(
     probability_up: float | None,
     fundamentals: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    ml_component = 50.0 if probability_up is None else probability_up * 100
-    rr_component = min(signal["risk_reward_ratio"] / 3, 1) * 100
-    fundamental_component = fundamental_score(fundamentals) * 10
-    final = (
-        signal["quant_score"] * 0.50
-        + ml_component * 0.25
-        + rr_component * 0.15
-        + fundamental_component * 0.10
-    )
+    # Deterministic sections total 90 points; ML contributes the final 10.
+    # Missing ML remains neutral rather than penalizing symbols with weak data.
+    ml_points = 5.0 if probability_up is None else probability_up * 10
+    final = signal["quant_score"] + ml_points
     final = round(float(np.clip(final, 0, 100)), 1)
     confidence = round(min(95.0, 45 + abs(final - 50) * 0.8), 1)
     return {
@@ -187,5 +197,6 @@ def combined_decision(
         "confidence": confidence,
         "probability_up_10d": None if probability_up is None else probability_up,
         "probability_down_10d": None if probability_up is None else 1 - probability_up,
+        "ml_score": round(ml_points, 1),
         "fundamental_score": fundamental_score(fundamentals),
     }

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
 import yfinance as yf
+from config import CACHE_DIR
 
 REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
 FUNDAMENTAL_FIELDS = {
@@ -19,12 +21,17 @@ FUNDAMENTAL_FIELDS = {
     "marketCap": "market_cap",
     "trailingPE": "pe_ratio",
     "forwardPE": "forward_pe",
+    "priceToSalesTrailing12Months": "price_to_sales",
     "revenueGrowth": "revenue_growth",
     "earningsGrowth": "earnings_growth",
     "profitMargins": "profit_margins",
+    "grossMargins": "gross_margins",
     "debtToEquity": "debt_to_equity",
     "beta": "beta",
     "averageVolume": "average_volume",
+    "freeCashflow": "free_cash_flow",
+    "recommendationKey": "analyst_recommendation",
+    "quoteType": "quote_type",
 }
 
 
@@ -69,14 +76,29 @@ def _normalize_download(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return result.dropna(subset=["Close"]).sort_index()
 
 
-def load_stock_data(ticker: str, period: str = "2y", retries: int = 2) -> pd.DataFrame:
+def _cache_path(symbol: str, period: str) -> Path:
+    return CACHE_DIR / f"{symbol.replace('^', '_')}_{period}.pkl"
+
+
+def load_stock_data(
+    ticker: str, period: str = "1y", retries: int = 2, use_disk_cache: bool = True
+) -> pd.DataFrame:
     """Download unadjusted OHLCV and adjusted close with bounded retries."""
     symbol = clean_ticker(ticker)
+    yahoo_symbol = symbol.replace(".", "-")
+    cache_file = _cache_path(yahoo_symbol, period)
+    if use_disk_cache and cache_file.exists():
+        age = time.time() - cache_file.stat().st_mtime
+        if age < 6 * 3600:
+            try:
+                return pd.read_pickle(cache_file)
+            except Exception:
+                pass
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
             frame = yf.download(
-                symbol,
+                yahoo_symbol,
                 period=period,
                 interval="1d",
                 auto_adjust=False,
@@ -90,6 +112,9 @@ def load_stock_data(ticker: str, period: str = "2y", retries: int = 2) -> pd.Dat
             result = _normalize_download(frame, symbol)
             if len(result) < 30:
                 raise ValueError(f"only {len(result)} usable trading days returned")
+            if use_disk_cache:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                result.to_pickle(cache_file)
             return result
         except Exception as error:
             last_error = error
@@ -116,7 +141,10 @@ def load_company_info(ticker: str, retries: int = 1) -> dict[str, Any]:
             info = yf.Ticker(symbol).get_info() or {}
             for source, target in FUNDAMENTAL_FIELDS.items():
                 value = info.get(source)
-                result[target] = value if target in {"company_name", "short_name", "sector", "industry"} else _number(value)
+                result[target] = value if target in {
+                    "company_name", "short_name", "sector", "industry",
+                    "analyst_recommendation", "quote_type",
+                } else _number(value)
             result["company_name"] = result.get("company_name") or result.get("short_name") or symbol
             result["sector"] = result.get("sector") or "Unknown"
             result["industry"] = result.get("industry") or "Unknown"

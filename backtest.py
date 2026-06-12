@@ -20,6 +20,8 @@ def run_backtest(
     buy_score: int = 80,
     sell_score: int = 45,
     risk_percent: float = 1.0,
+    fee_per_trade: float = 0.0,
+    slippage_pct: float = 0.0,
 ) -> dict:
     if initial_cash <= 0:
         raise ValueError("Initial cash must be greater than zero.")
@@ -33,7 +35,7 @@ def run_backtest(
 
     cash = float(initial_cash)
     shares = 0.0
-    entry_price = stop = 0.0
+    entry_price = stop = target = 0.0
     entry_date = None
     trades: list[dict] = []
     equity_values: list[float] = []
@@ -42,22 +44,31 @@ def run_backtest(
         if shares == 0 and row["Score"] >= buy_score:
             levels = calculate_trade_levels(row)
             sizing = position_size(cash, price, levels["stop_loss"], risk_percent, 100)
-            shares = min(sizing["max_shares"], cash / price)
+            fill_price = price * (1 + slippage_pct / 100)
+            shares = min(sizing["max_shares"], max(0, cash - fee_per_trade) / fill_price)
             if shares > 0:
-                entry_price, stop, entry_date = price, levels["stop_loss"], date
-                cash -= shares * price
-        elif shares > 0 and (row["Score"] < sell_score or price <= stop):
-            proceeds = shares * price
-            pnl = (price - entry_price) * shares
+                entry_price, stop, target, entry_date = (
+                    fill_price, levels["stop_loss"], levels["take_profit_2r"], date
+                )
+                cash -= shares * fill_price + fee_per_trade
+        elif shares > 0 and (row["Score"] < sell_score or row["Low"] <= stop or row["High"] >= target):
+            if row["Low"] <= stop:
+                exit_price, reason = stop * (1 - slippage_pct / 100), "Stop-loss hit"
+            elif row["High"] >= target:
+                exit_price, reason = target * (1 - slippage_pct / 100), "Take-profit hit"
+            else:
+                exit_price, reason = price * (1 - slippage_pct / 100), "Score below 45"
+            proceeds = shares * exit_price - fee_per_trade
+            pnl = proceeds - shares * entry_price - fee_per_trade
             trades.append({
                 "Entry Date": entry_date,
                 "Exit Date": date,
                 "Entry Price": entry_price,
-                "Exit Price": price,
+                "Exit Price": exit_price,
                 "Shares": shares,
                 "P/L": pnl,
-                "Return %": (price / entry_price - 1) * 100,
-                "Exit Reason": "Stop-loss hit" if price <= stop else "Score below 45",
+                "Return %": (exit_price / entry_price - 1) * 100,
+                "Exit Reason": reason,
             })
             cash += proceeds
             shares = 0.0

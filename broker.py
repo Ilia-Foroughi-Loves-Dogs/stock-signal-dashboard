@@ -19,5 +19,5 @@ def preview_order(*args: Any, **kwargs: Any) -> dict[str, str]:
 
 def place_order(*args: Any, **kwargs: Any) -> None:
     raise RuntimeError(
-        "Real trading is disabled. This app only supports paper trading right now."
+        "Real trading is disabled. This app only supports paper trading."
     )

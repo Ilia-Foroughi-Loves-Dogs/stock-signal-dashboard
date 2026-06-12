@@ -13,11 +13,14 @@ def calculate_trade_levels(row: pd.Series) -> dict[str, Any]:
     atr = max(float(row.get("ATR", 0) or 0), price * 0.005)
     support = float(row.get("Support", np.nan))
     sma_50 = float(row.get("SMA_50", np.nan))
-    stop_candidates = [price - 2 * atr]
+    atr_stop = price - 2 * atr
+    support_stop = support * 0.995 if pd.notna(support) and support < price else np.nan
+    sma_stop = sma_50 * 0.98 if pd.notna(sma_50) and sma_50 < price else np.nan
+    stop_candidates = [atr_stop]
     if pd.notna(support) and support < price:
-        stop_candidates.append(support * 0.995)
+        stop_candidates.append(support_stop)
     if pd.notna(sma_50) and sma_50 < price:
-        stop_candidates.append(sma_50 * 0.98)
+        stop_candidates.append(sma_stop)
     stop = max(0.01, max(value for value in stop_candidates if value < price))
     risk = max(price - stop, price * 0.005)
     resistance = float(row.get("Resistance", np.nan))
@@ -30,6 +33,9 @@ def calculate_trade_levels(row: pd.Series) -> dict[str, Any]:
         "buy_zone_low": buy_low,
         "buy_zone_high": price + 0.25 * atr,
         "stop_loss": stop,
+        "atr_stop": atr_stop,
+        "support_stop": support_stop,
+        "sma_50_stop": sma_stop,
         "risk_per_share": risk,
         "take_profit_2r": target_2r,
         "take_profit_3r": target_3r,
@@ -63,7 +69,8 @@ def position_size(
 
 
 def risk_warnings(
-    score: float, atr_pct: float, allocation_pct: float = 0, exposure_pct: float = 0
+    score: float, atr_pct: float, allocation_pct: float = 0, exposure_pct: float = 0,
+    average_volume: float | None = None,
 ) -> list[str]:
     warnings: list[str] = []
     if atr_pct > 5:
@@ -74,4 +81,8 @@ def risk_warnings(
         warnings.append("Portfolio exposure exceeds 80%; little fake cash remains.")
     if score < 65:
         warnings.append("The setup score is below the Buy Watch threshold.")
+    if average_volume is not None and average_volume < 500_000:
+        warnings.append("Low liquidity: spreads and simulated fills may be unreliable.")
+    if atr_pct > 8:
+        warnings.append("Gap/spread risk may be large relative to the planned stop.")
     return warnings

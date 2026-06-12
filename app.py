@@ -1,4 +1,4 @@
-"""Streamlit UI for the educational AI Quant Scanner."""
+"""Streamlit UI for the educational full-market AI quant scanner."""
 
 from __future__ import annotations
 
@@ -14,496 +14,402 @@ from ai_engine import analyze_stock
 from backtest import run_backtest
 from broker import connect_broker
 from config import (
-    APP_NAME,
-    DEFAULT_MAX_ALLOCATION,
-    DEFAULT_MAX_WORKERS,
-    DEFAULT_PAPER_CASH,
-    DEFAULT_RISK_PER_TRADE,
-    DEFAULT_SCAN_PERIOD,
-    DEFAULT_TICKERS,
-    DISCLAIMER,
-    MAX_SCAN_WORKERS,
-    SCAN_PERIODS,
+    APP_NAME, DEFAULT_MAX_ALLOCATION, DEFAULT_MAX_WORKERS, DEFAULT_PAPER_CASH,
+    DEFAULT_RISK_PER_TRADE, DISCLAIMER, MAX_SCAN_WORKERS, SCAN_PERIODS,
     SCORE_MAXIMUMS,
 )
-from data import load_company_info, load_stock_data, parse_tickers
+from data import load_company_info, load_stock_data
 from indicators import add_indicators
 from paper_trading import execute_paper_order, portfolio_summary
 from risk import position_size, risk_warnings
 from scanner import analyze_ticker, scan_tickers
+from universe import build_universe
 
 load_dotenv()
-st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.25rem; max-width: 1500px}
-    [data-testid="stMetric"] {background:#11182710; border:1px solid #64748b35;
-      border-radius:12px; padding:12px}
-    .quant-card {border:1px solid #64748b45; border-radius:14px; padding:14px;
-      margin:8px 0; background:linear-gradient(135deg,#0f172a08,#2563eb08)}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title=APP_NAME, layout="wide")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def cached_prices(ticker: str, period: str) -> pd.DataFrame:
     return load_stock_data(ticker, period)
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def cached_info(ticker: str) -> dict:
     return load_company_info(ticker)
 
 
-def get_analysis(ticker: str, period: str, run_ml: bool = True) -> dict:
-    return analyze_ticker(ticker, period, cached_prices, cached_info, run_ml)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_universe(source: str, asset_type: str, include_otc: bool):
+    return build_universe(source, asset_type, include_otc)
 
 
-def ai_payload(analysis: dict, backtest: dict | None = None) -> dict:
-    ml = analysis["ml"]
+def analysis_for(ticker: str, period: str, ml: bool = True) -> dict:
+    return analyze_ticker(ticker, period, cached_prices, cached_info, ml)
+
+
+def ai_payload(analysis: dict) -> dict:
     return {
         "ticker": analysis["ticker"],
         "decision": analysis["decision"],
         "fundamentals": analysis["fundamentals"],
-        "ml": {
-            "accuracy": ml.get("accuracy"),
-            "probability_up_10d": ml.get("probability_up_10d"),
-            "samples": ml.get("samples"),
-        },
-        "backtest": None if backtest is None else {
-            key: value for key, value in backtest.items()
-            if key not in {"history", "trades"}
-        },
+        "ml": {key: value for key, value in analysis["ml"].items()
+               if key not in {"models", "features"}},
     }
 
 
-def price_figure(data: pd.DataFrame, ticker: str) -> go.Figure:
-    figure = go.Figure()
-    figure.add_trace(go.Candlestick(
+def show_ai(analysis: dict, use_openai: bool) -> None:
+    result = analyze_stock(ai_payload(analysis), use_openai)
+    st.subheader(f"{result['ticker']}: {result['rating']}")
+    st.caption(f"{result['source']} | confidence {result['confidence']}%")
+    st.write(result["plain_english_summary"])
+    columns = st.columns(5)
+    columns[0].metric("Best buy zone", result["best_buy_zone"])
+    columns[1].metric("Stop", result["stop_loss"])
+    columns[2].metric("Target 1", result["take_profit_1"])
+    columns[3].metric("Target 2", result["take_profit_2"])
+    columns[4].metric("Exit zone", result["sell_or_exit_zone"])
+    st.warning(f"Avoid zone: {result['avoid_zone']}")
+    reasons, risks, changes = st.columns(3)
+    reasons.write({"Main reasons": result["main_reasons"]})
+    risks.write({"Main risks": result["main_risks"]})
+    changes.write({"What changes the view": result["what_would_change_my_mind"]})
+    st.info(result["beginner_explanation"])
+
+
+def price_chart(data: pd.DataFrame, ticker: str) -> go.Figure:
+    figure = go.Figure(go.Candlestick(
         x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
         close=data["Close"], name=ticker,
     ))
     for column, color in [
-        ("SMA_20", "#22c55e"), ("SMA_50", "#f59e0b"), ("SMA_200", "#ef4444"),
-        ("EMA_9", "#06b6d4"), ("EMA_21", "#8b5cf6"),
+        ("SMA_20", "#16a34a"), ("SMA_50", "#f59e0b"), ("SMA_200", "#dc2626"),
+        ("EMA_9", "#0891b2"), ("EMA_21", "#7c3aed"),
     ]:
-        figure.add_trace(go.Scatter(
-            x=data.index, y=data[column], name=column.replace("_", " "),
-            line={"color": color, "width": 1.3},
-        ))
-    latest = data.dropna(subset=["Support", "Resistance"]).iloc[-1]
-    figure.add_hline(y=latest["Support"], line_dash="dot", line_color="#22c55e",
-                     annotation_text="Support")
-    figure.add_hline(y=latest["Resistance"], line_dash="dot", line_color="#ef4444",
-                     annotation_text="Resistance")
-    figure.update_layout(
-        title=f"{ticker} Price Structure", template="plotly_white", height=600,
-        xaxis_rangeslider_visible=False, hovermode="x unified",
+        figure.add_scatter(x=data.index, y=data[column], name=column, line={"color": color})
+    row = data.dropna(subset=["Support", "Resistance"]).iloc[-1]
+    figure.add_hline(y=row["Support"], line_dash="dot", line_color="green")
+    figure.add_hline(y=row["Resistance"], line_dash="dot", line_color="red")
+    figure.update_layout(height=580, xaxis_rangeslider_visible=False, hovermode="x unified")
+    return figure
+
+
+def technical_chart(data: pd.DataFrame) -> go.Figure:
+    figure = make_subplots(rows=3, cols=1, shared_xaxes=True)
+    figure.add_scatter(x=data.index, y=data["RSI"], name="RSI", row=1, col=1)
+    figure.add_scatter(x=data.index, y=data["MACD"], name="MACD", row=2, col=1)
+    figure.add_scatter(x=data.index, y=data["MACD_Signal"], name="Signal", row=2, col=1)
+    figure.add_bar(x=data.index, y=data["Volume"], name="Volume", row=3, col=1)
+    figure.update_layout(height=650, hovermode="x unified")
+    return figure
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_money(value: object) -> str:
+    number = _safe_float(value)
+    return "N/A" if number is None else f"${number:.2f}"
+
+
+def safe_percent(value: object) -> str:
+    number = _safe_float(value)
+    return "N/A" if number is None else f"{number:+.2f}%"
+
+
+def safe_number(value: object) -> str:
+    number = _safe_float(value)
+    return "N/A" if number is None else f"{number:.1f}"
+
+
+def safe_ratio(value: object) -> str:
+    number = _safe_float(value)
+    return "N/A" if number is None else f"{number:.2f}"
+
+
+def result_table(frame: pd.DataFrame) -> None:
+    formatters = {
+        "Latest Price": safe_money,
+        "Daily %": safe_percent,
+        "Final Score": safe_number,
+        "ML Probability Up 10D": safe_percent,
+        "RSI": safe_number,
+        "Relative Volume": safe_ratio,
+        "ATR %": safe_percent,
+        "Risk/Reward": safe_ratio,
+        "Stop-Loss Idea": safe_money,
+        "Take-Profit Idea": safe_money,
+    }
+    available_formatters = {
+        column: formatter
+        for column, formatter in formatters.items()
+        if column in frame.columns
+    }
+    styled_frame = frame.style.format(available_formatters, na_rep="N/A")
+    st.dataframe(
+        styled_frame,
+        hide_index=True,
+        use_container_width=True,
+        height=620,
     )
-    return figure
-
-
-def technical_figure(data: pd.DataFrame) -> go.Figure:
-    figure = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.28, 0.38, 0.34],
-    )
-    figure.add_trace(go.Scatter(x=data.index, y=data["RSI"], name="RSI"), row=1, col=1)
-    figure.add_hline(y=70, line_dash="dash", line_color="#ef4444", row=1, col=1)
-    figure.add_hline(y=30, line_dash="dash", line_color="#22c55e", row=1, col=1)
-    colors = ["#22c55e" if value >= 0 else "#ef4444" for value in data["MACD_Hist"].fillna(0)]
-    figure.add_trace(go.Bar(x=data.index, y=data["MACD_Hist"], name="MACD Hist",
-                            marker_color=colors), row=2, col=1)
-    figure.add_trace(go.Scatter(x=data.index, y=data["MACD"], name="MACD"), row=2, col=1)
-    figure.add_trace(go.Scatter(x=data.index, y=data["MACD_Signal"], name="Signal"), row=2, col=1)
-    figure.add_trace(go.Bar(x=data.index, y=data["Volume"], name="Volume"), row=3, col=1)
-    figure.add_trace(go.Scatter(x=data.index, y=data["Volume_Avg_20"],
-                                name="20D Avg Volume"), row=3, col=1)
-    figure.update_layout(template="plotly_white", height=700, hovermode="x unified")
-    return figure
-
-
-def equity_figure(result: dict, ticker: str) -> go.Figure:
-    history = result["history"]
-    figure = go.Figure()
-    figure.add_trace(go.Scatter(x=history.index, y=history["Strategy Portfolio"],
-                                name="Quant Strategy"))
-    figure.add_trace(go.Scatter(x=history.index, y=history["Buy and Hold Portfolio"],
-                                name="Buy and Hold"))
-    figure.update_layout(title=f"{ticker} Equity Curve", template="plotly_white",
-                         height=480, yaxis_title="Fake portfolio value")
-    return figure
-
-
-def show_decision(decision: dict) -> None:
-    columns = st.columns(6)
-    columns[0].metric("Signal", decision["final_signal"])
-    columns[1].metric("Final Score", f"{decision['final_score']:.1f}/100")
-    columns[2].metric("Quant Score", f"{decision['quant_score']}/100")
-    probability = decision["probability_up_10d"]
-    columns[3].metric("ML Up 10D", "N/A" if probability is None else f"{probability:.1%}")
-    columns[4].metric("RSI", f"{decision['rsi']:.1f}")
-    columns[5].metric("Relative Volume", f"{decision['relative_volume']:.2f}x")
-    st.progress(decision["final_score"] / 100)
-
-
-def show_ai(analysis: dict, use_openai: bool) -> None:
-    ai = analyze_stock(ai_payload(analysis), use_openai=use_openai)
-    st.markdown(f"### {ai['rating']} · {ai['confidence']}% confidence")
-    st.caption(ai["source"])
-    st.write(ai["plain_english_summary"])
-    levels = st.columns(4)
-    levels[0].metric("Buy Zone", ai["buy_zone"])
-    levels[1].metric("Stop-Loss", ai["stop_loss"])
-    levels[2].metric("Take-Profit", ai["take_profit"])
-    levels[3].metric("Sell Zone", ai["sell_zone"])
-    reasons, risks, invalidation = st.columns(3)
-    with reasons:
-        st.markdown("**Main reasons**")
-        for item in ai["main_reasons"]:
-            st.success(item)
-    with risks:
-        st.markdown("**Main risks**")
-        for item in ai["main_risks"]:
-            st.warning(item)
-    with invalidation:
-        st.markdown("**What changes the view**")
-        for item in ai["what_would_change_my_mind"]:
-            st.error(item)
 
 
 st.title(APP_NAME)
 st.warning(DISCLAIMER)
 
 with st.sidebar:
-    st.header("Quant Controls")
-    universe_mode = st.radio("Universe", ["Default universe", "Custom tickers"])
-    custom_tickers = st.text_area(
-        "Comma-separated tickers", "AAPL, MSFT, NVDA",
-        disabled=universe_mode == "Default universe",
-    )
-    period = st.selectbox("History", SCAN_PERIODS, index=SCAN_PERIODS.index(DEFAULT_SCAN_PERIOD))
-    enable_ml = st.toggle("Train advisory ML models", value=True)
-    max_workers = st.slider(
-        "Parallel workers",
-        min_value=1,
-        max_value=MAX_SCAN_WORKERS,
-        value=DEFAULT_MAX_WORKERS,
-        help="Higher values scan faster but use more CPU and network connections.",
-    )
+    st.header("Global Settings")
+    period = st.selectbox("History period", SCAN_PERIODS, index=1)
+    max_workers = st.slider("Max workers", 1, MAX_SCAN_WORKERS, DEFAULT_MAX_WORKERS)
+    enable_ml = st.toggle("Train ML models", value=True)
     use_openai = st.toggle(
-        "Use OpenAI explanations",
-        value=False,
+        "Use optional OpenAI analyst", value=False,
         disabled=not bool(os.getenv("OPENAI_API_KEY")),
-        help="Falls back to deterministic local explanations when disabled or unavailable.",
     )
-    starting_cash = st.number_input("Starting fake cash", min_value=1_000.0,
-                                     value=DEFAULT_PAPER_CASH, step=1_000.0)
-    risk_percent = st.slider("Risk per paper trade (%)", 0.25, 2.0,
+    risk_percent = st.slider("Risk per fake trade (%)", 0.25, 2.0,
                              DEFAULT_RISK_PER_TRADE, 0.25)
-    max_allocation = st.slider("Max allocation per stock (%)", 5.0, 30.0,
+    max_allocation = st.slider("Max allocation (%)", 1.0, 20.0,
                                DEFAULT_MAX_ALLOCATION, 1.0)
-
-try:
-    selected_tickers = (
-        DEFAULT_TICKERS.copy()
-        if universe_mode == "Default universe"
-        else parse_tickers(custom_tickers)
-    )
-except ValueError as error:
-    st.sidebar.error(str(error))
-    selected_tickers = DEFAULT_TICKERS.copy()
+    starting_cash = st.number_input("Starting fake cash", 1_000.0, value=DEFAULT_PAPER_CASH)
 
 tabs = st.tabs([
-    "AI Market Scanner", "Single Stock Deep Analysis", "AI Buy/Sell Brain",
+    "Full Market Scanner", "Best Chances", "Single Stock Deep Dive", "AI Analyst",
     "Backtest", "Paper Trading", "Risk Manager", "Settings",
 ])
 
 with tabs[0]:
-    st.subheader("AI Market Scanner")
-    st.caption("Ranks educational watch setups. A high score is not a prediction or instruction.")
-    if st.button("Run AI Quant Scan", type="primary", use_container_width=True):
-        bar = st.progress(0, "Starting scan...")
+    st.subheader("Full Market Scanner")
+    controls = st.columns(4)
+    source = controls[0].selectbox("Universe source", ["Nasdaq Trader", "Alpaca (optional)"])
+    asset_type = controls[1].selectbox("Asset type", ["Stocks + ETFs", "Stocks only", "ETFs only"])
+    scan_choice = controls[2].selectbox("Scan limit", ["50", "100", "500", "1000", "All"])
+    include_otc = controls[3].checkbox("Include OTC", value=False)
+    filters = st.columns(4)
+    min_price = filters[0].number_input("Minimum price", 0.0, value=1.0)
+    max_price = filters[1].number_input("Maximum price", 0.0, value=10_000.0)
+    min_volume = filters[2].number_input("Minimum average volume", 0, value=500_000, step=100_000)
+    min_market_cap = filters[3].number_input("Minimum market cap", 0, value=0, step=100_000_000)
+    minimum_score = st.slider("Minimum score", 0, 100, 0)
+    full_scan = st.checkbox("Full scan mode", value=False,
+                            help="Large scans can take a long time and providers may rate-limit requests.")
+    if st.button("Run market scan", type="primary", use_container_width=True):
+        universe, universe_warnings = cached_universe(source, asset_type, include_otc)
+        limit = len(universe) if scan_choice == "All" else int(scan_choice)
+        if scan_choice == "All" and not full_scan:
+            limit = min(1000, len(universe))
+            universe_warnings.append("Enable full scan mode to scan more than 1,000 symbols.")
+        selected = universe.head(limit)
+        metadata = selected.set_index("ticker")[["asset_type", "exchange"]].to_dict("index")
+        bar = st.progress(0, "Preparing scan")
 
         def progress(ticker: str, count: int) -> None:
-            bar.progress(count / len(selected_tickers),
-                         f"Analyzing {ticker} ({count}/{len(selected_tickers)})")
+            bar.progress(count / len(selected), f"{ticker}: {count}/{len(selected)}")
 
-        try:
-            results, errors, analyses = scan_tickers(
-                selected_tickers,
-                period,
-                cached_prices,
-                cached_info,
-                enable_ml,
-                progress,
-                max_workers,
-            )
-        except Exception as error:
-            bar.empty()
-            st.error(f"Scan could not be completed: {error}")
-        else:
-            st.session_state["scan_results"] = results
-            st.session_state["scan_errors"] = errors
-            st.session_state["scan_analyses"] = analyses
-            bar.empty()
-
+        results, errors, analyses = scan_tickers(
+            selected["ticker"], period, cached_prices, cached_info, enable_ml,
+            progress, max_workers, metadata,
+        )
+        if not results.empty:
+            market_caps = {ticker: item["fundamentals"].get("market_cap")
+                           for ticker, item in analyses.items()}
+            results["Market Cap"] = results["Ticker"].map(market_caps)
+            results = results[
+                (results["Latest Price"] >= min_price)
+                & (results["Latest Price"] <= max_price)
+                & (results["Average Volume"] >= min_volume)
+                & (results["Final Score"] >= minimum_score)
+                & ((results["Market Cap"].fillna(0) >= min_market_cap) | (min_market_cap == 0))
+            ].reset_index(drop=True)
+            results["Rank"] = range(1, len(results) + 1)
+        st.session_state.update(
+            scan_results=results, scan_errors=errors, scan_analyses=analyses,
+            universe_warnings=universe_warnings,
+        )
+        bar.empty()
     results = st.session_state.get("scan_results", pd.DataFrame())
     if results.empty:
-        st.info("Run the scanner to build the ranked watch list.")
+        st.info("Run a 50-symbol scan first to validate provider access and performance.")
     else:
-        filters = st.columns(5)
-        minimum_score = filters[0].number_input("Minimum score", 0, 100, 0)
-        minimum_volume = filters[1].number_input("Minimum avg volume", 0, 100_000_000, 0,
-                                                  step=100_000)
-        sectors = ["All"] + sorted(results["Sector"].fillna("Unknown").unique().tolist())
-        sector = filters[2].selectbox("Sector", sectors)
-        signals = ["All"] + sorted(results["Signal"].unique().tolist())
-        signal_filter = filters[3].selectbox("Signal type", signals)
-        hide_weak = filters[4].checkbox("Hide weak stocks")
-        strong_only = st.checkbox("Show only Strong Buy Watch and above")
-        shown = results[
-            (results["Final Score"] >= minimum_score)
-            & (results["Average Volume"] >= minimum_volume)
-        ].copy()
-        if sector != "All":
-            shown = shown[shown["Sector"] == sector]
-        if signal_filter != "All":
-            shown = shown[shown["Signal"] == signal_filter]
-        if hide_weak:
-            shown = shown[shown["Final Score"] >= 45]
-        if strong_only:
-            shown = shown[shown["Final Score"] >= 80]
-        st.dataframe(
-            shown.style.format({
-                "Latest Price": "${:,.2f}", "Daily %": "{:+.2f}%",
-                "Final Score": "{:.1f}", "ML Probability Up": "{:.1f}%",
-                "RSI": "{:.1f}", "Relative Volume": "{:.2f}x",
-                "Average Volume": "{:,.0f}", "Stop-Loss Idea": "${:,.2f}",
-                "Take-Profit Idea": "${:,.2f}", "Risk/Reward": "{:.1f}:1",
-            }),
-            hide_index=True, use_container_width=True, height=650,
-        )
-        st.download_button(
-            "Download shown results as CSV",
-            data=shown.to_csv(index=False).encode("utf-8"),
-            file_name="scanner_results.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        result_table(results)
+        st.download_button("Download scanner results", results.to_csv(index=False),
+                           "scanner_results.csv", "text/csv")
+    for warning in st.session_state.get("universe_warnings", []):
+        st.warning(warning)
     errors = st.session_state.get("scan_errors", {})
     if errors:
-        with st.expander(f"{len(errors)} ticker(s) could not be scanned"):
+        with st.expander(f"{len(errors)} symbols failed without stopping the scan"):
             st.json(errors)
 
 with tabs[1]:
-    st.subheader("Single Stock Deep Analysis")
-    ticker = st.selectbox("Ticker", selected_tickers, key="deep_ticker")
-    try:
-        with st.spinner(f"Analyzing {ticker}..."):
-            analysis = get_analysis(ticker, period, enable_ml)
-        decision, data, info = analysis["decision"], analysis["data"], analysis["fundamentals"]
-        st.caption(f"{info.get('company_name', ticker)} · {info.get('sector', 'Unknown')} · "
-                   f"latest session {decision['date']:%B %d, %Y}")
-        show_decision(decision)
-        st.plotly_chart(price_figure(data, ticker), use_container_width=True)
-        score_column, fundamental_column = st.columns(2)
-        with score_column:
-            st.markdown("#### Score Breakdown")
-            score_frame = pd.DataFrame({
-                "Section": decision["category_scores"].keys(),
-                "Points": decision["category_scores"].values(),
-                "Maximum": SCORE_MAXIMUMS.values(),
-            })
-            st.dataframe(score_frame, hide_index=True, use_container_width=True)
-        with fundamental_column:
-            st.markdown("#### Company Data")
-            st.json({
-                "Market cap": info.get("market_cap"),
-                "Industry": info.get("industry"),
-                "PE ratio": info.get("pe_ratio"),
-                "Forward PE": info.get("forward_pe"),
-                "Revenue growth": info.get("revenue_growth"),
-                "Earnings growth": info.get("earnings_growth"),
-                "Profit margins": info.get("profit_margins"),
-                "Debt/equity": info.get("debt_to_equity"),
-                "Beta": info.get("beta"),
-            })
-        show_ai(analysis, use_openai)
-        st.plotly_chart(technical_figure(data), use_container_width=True)
-    except Exception as error:
-        st.error(f"Could not analyze {ticker}: {error}")
-
-with tabs[2]:
-    st.subheader("AI Buy/Sell Brain")
+    st.subheader("Best Chances")
     results = st.session_state.get("scan_results", pd.DataFrame())
     analyses = st.session_state.get("scan_analyses", {})
     if results.empty:
-        st.info("Run the AI Market Scanner first.")
+        st.info("Run the Full Market Scanner first.")
     else:
-        best, worst = st.columns(2)
-        with best:
-            st.markdown("### Top 10 Best Setups")
-            for _, row in results.head(10).iterrows():
-                with st.expander(
-                    f"#{row['Rank']} {row['Ticker']} · {row['Signal']} · "
-                    f"{row['Final Score']:.1f}"
-                ):
-                    decision = analyses[row["Ticker"]]["decision"]
-                    st.write(" ".join(decision["strengths"]))
-                    st.caption(f"Risk/reward {decision['risk_reward_ratio']:.1f}:1 · "
-                               f"stop ${decision['stop_loss']:,.2f}")
-        with worst:
-            st.markdown("### Top 10 Worst / Exit Setups")
-            for _, row in results.tail(10).sort_values("Final Score").iterrows():
-                with st.expander(f"{row['Ticker']} · {row['Signal']} · {row['Final Score']:.1f}"):
-                    decision = analyses[row["Ticker"]]["decision"]
-                    for risk in decision["risks"]:
-                        st.warning(risk)
-        rr = results[results["Final Score"] >= 65].sort_values("Risk/Reward", ascending=False).head(10)
-        st.markdown("### Best Risk/Reward Opportunities")
-        st.dataframe(rr[["Ticker", "Signal", "Final Score", "Risk/Reward",
-                         "Stop-Loss Idea", "Take-Profit Idea"]].style.format({
-                             "Final Score": "{:.1f}", "Risk/Reward": "{:.1f}:1",
-                             "Stop-Loss Idea": "${:,.2f}", "Take-Profit Idea": "${:,.2f}",
-                         }), hide_index=True, use_container_width=True)
-        risky = results[
-            (results["RSI"] > 70) | (results["Risk/Reward"] < 2) | (results["Final Score"] < 45)
-        ]
-        st.markdown("### Too Risky / Overextended Warnings")
-        st.dataframe(risky[["Ticker", "Signal", "Final Score", "RSI", "Risk/Reward"]],
-                     hide_index=True, use_container_width=True)
-        brain_ticker = st.selectbox("Deep-analyze a ranked ticker", results["Ticker"],
-                                    key="brain_ticker")
-        show_ai(analyses[brain_ticker], use_openai)
+        groups = {
+            "Elite / Strong Buy Watch": results[results["Final Score"] >= 80].head(10),
+            "Best risk/reward": results.sort_values("Risk/Reward", ascending=False).head(10),
+            "Momentum breakouts": results.sort_values(
+                ["Relative Volume", "Daily %"], ascending=False
+            ).head(10),
+            "High-quality trends": results.sort_values(
+                ["Quant Score", "Final Score"], ascending=False
+            ).head(10),
+            "Sell / Exit Watch": results.sort_values("Final Score").head(10),
+        }
+        for title, frame in groups.items():
+            st.markdown(f"### {title}")
+            for row in frame.itertuples(index=False):
+                ticker = getattr(row, "Ticker")
+                decision = analyses[ticker]["decision"]
+                with st.expander(f"{ticker} | {decision['final_signal']} | {decision['final_score']:.1f}"):
+                    st.write("Why ranked:", " ".join(decision["strengths"]))
+                    st.write("Risk:", " ".join(decision["risks"]))
+                    st.write(f"Invalidation: close below ${decision['stop_loss']:.2f} "
+                             f"or score below 45.")
+
+with tabs[2]:
+    st.subheader("Single Stock Deep Dive")
+    deep_ticker = st.text_input("Ticker", "AAPL").strip().upper()
+    if st.button("Analyze ticker", key="deep_button"):
+        try:
+            st.session_state["deep_analysis"] = analysis_for(deep_ticker, period, enable_ml)
+        except Exception as error:
+            st.error(str(error))
+    analysis = st.session_state.get("deep_analysis")
+    if analysis:
+        decision, data = analysis["decision"], analysis["data"]
+        metrics = st.columns(5)
+        metrics[0].metric("Signal", decision["final_signal"])
+        metrics[1].metric("Final score", f"{decision['final_score']:.1f}")
+        metrics[2].metric("Price", f"${decision['price']:.2f}")
+        probability = decision["probability_up_10d"]
+        metrics[3].metric("ML up 10D", "N/A" if probability is None else f"{probability:.1%}")
+        metrics[4].metric("Risk/reward", f"{decision['risk_reward_ratio']:.1f}:1")
+        st.plotly_chart(price_chart(data, analysis["ticker"]), use_container_width=True)
+        score = pd.DataFrame({
+            "Section": list(decision["category_scores"]),
+            "Points": list(decision["category_scores"].values()),
+            "Maximum": list(SCORE_MAXIMUMS.values()),
+        })
+        st.dataframe(score, hide_index=True)
+        show_ai(analysis, use_openai)
+        st.plotly_chart(technical_chart(data), use_container_width=True)
 
 with tabs[3]:
-    st.subheader("Backtest")
-    st.caption("Fake $10,000 account; entries at score 80+, exits below 45 or at the stop.")
-    ticker = st.selectbox("Backtest ticker", selected_tickers, key="backtest_ticker")
-    try:
-        data = add_indicators(cached_prices(ticker, period))
-        result = run_backtest(data, risk_percent=risk_percent)
-        metrics = st.columns(6)
-        metrics[0].metric("Final Value", f"${result['final_value']:,.2f}")
-        metrics[1].metric("Total Return", f"{result['total_return_pct']:.2f}%")
-        metrics[2].metric("Buy & Hold", f"{result['buy_and_hold_return_pct']:.2f}%")
-        metrics[3].metric("Max Drawdown", f"{result['max_drawdown_pct']:.2f}%")
-        metrics[4].metric("Trades", result["number_of_trades"])
-        metrics[5].metric("Win Rate", "N/A" if result["win_rate_pct"] is None
-                          else f"{result['win_rate_pct']:.1f}%")
-        extra = st.columns(3)
-        extra[0].metric("Average Win", "N/A" if result["average_win"] is None
-                        else f"${result['average_win']:,.2f}")
-        extra[1].metric("Average Loss", "N/A" if result["average_loss"] is None
-                        else f"${result['average_loss']:,.2f}")
-        extra[2].metric("Profit Factor", "N/A" if result["profit_factor"] is None
-                        else f"{result['profit_factor']:.2f}")
-        st.plotly_chart(equity_figure(result, ticker), use_container_width=True)
-        st.dataframe(result["trades"], hide_index=True, use_container_width=True)
-        st.warning("Historical results omit slippage, fees, taxes, and intraday gaps. "
-                   "Backtest performance does not guarantee future results.")
-    except Exception as error:
-        st.error(f"Could not backtest {ticker}: {error}")
+    st.subheader("AI Analyst")
+    results = st.session_state.get("scan_results", pd.DataFrame())
+    analyses = st.session_state.get("scan_analyses", {})
+    if results.empty:
+        st.info("Run a scan first. AI is intentionally limited to top 20, worst 20, or one selected stock.")
+    else:
+        allowed = list(dict.fromkeys(
+            results.head(20)["Ticker"].tolist() + results.tail(20)["Ticker"].tolist()
+        ))
+        ticker = st.selectbox("Top/worst ranked ticker", allowed)
+        if ticker in analyses:
+            show_ai(analyses[ticker], use_openai)
 
 with tabs[4]:
-    st.subheader("Paper Trading")
-    st.info("Fake money only. Orders are local CSV simulations and never reach a broker.")
-    ticker = st.selectbox("Paper ticker", selected_tickers, key="paper_ticker")
-    side = st.radio("Action", ["BUY", "SELL"], horizontal=True)
-    amount = st.number_input("Fake dollar amount", min_value=1.0, value=1_000.0, step=100.0)
-    try:
-        analysis = get_analysis(ticker, "1y", False)
-        decision = analysis["decision"]
-        price = decision["price"]
-        shares = amount / price
-        sizing = position_size(starting_cash, price, decision["stop_loss"],
-                               risk_percent, max_allocation)
-        st.table(pd.DataFrame([{
-            "Ticker": ticker, "Action": f"Paper {side}", "Fake amount": f"${amount:,.2f}",
-            "Current daily close": f"${price:,.2f}", "Estimated shares": f"{shares:,.4f}",
-            "Stop-loss idea": f"${decision['stop_loss']:,.2f}",
-            "Risk amount": f"${shares * (price - decision['stop_loss']):,.2f}",
-        }]))
-        if side == "BUY" and shares > sizing["max_shares"]:
-            st.warning(f"This exceeds the risk manager ceiling of {sizing['max_shares']:,.4f} shares.")
-        confirmed = st.checkbox("I understand this is a fake paper order.", key="paper_confirm")
-        if st.button(f"Record Paper {side}", type="primary", disabled=not confirmed):
-            execute_paper_order(ticker, side, amount, price, starting_cash, confirmed=True)
-            st.success(f"Recorded fake {side.lower()} for {ticker}.")
-            st.rerun()
-    except Exception as error:
-        st.error(f"Paper order preview unavailable: {error}")
-
-    try:
-        first = portfolio_summary(starting_cash)
-        prices = {}
-        if not first["positions"].empty:
-            for symbol in first["positions"]["Ticker"]:
-                try:
-                    prices[symbol] = float(cached_prices(symbol, "1y")["Adj Close"].iloc[-1])
-                except Exception:
-                    pass
-        portfolio = portfolio_summary(starting_cash, prices)
-        metrics = st.columns(5)
-        metrics[0].metric("Fake Cash", f"${portfolio['cash']:,.2f}")
-        metrics[1].metric("Position Value", f"${portfolio['market_value']:,.2f}")
-        metrics[2].metric("Paper Equity", f"${portfolio['equity']:,.2f}")
-        metrics[3].metric("Unrealized P/L", f"${portfolio['unrealized_pnl']:,.2f}")
-        metrics[4].metric("Realized P/L", f"${portfolio['realized_pnl']:,.2f}")
-        st.markdown("#### Paper Portfolio")
-        st.dataframe(portfolio["positions"], hide_index=True, use_container_width=True)
-        with st.expander("Paper Trade History"):
-            st.dataframe(portfolio["trades"], hide_index=True, use_container_width=True)
-    except Exception as error:
-        st.error(f"Could not load paper portfolio: {error}")
+    st.subheader("Backtest")
+    ticker = st.text_input("Backtest ticker", "SPY")
+    fees = st.number_input("Fee per fake trade", 0.0, value=0.0)
+    slippage = st.number_input("Slippage (%)", 0.0, value=0.05, step=0.01)
+    if st.button("Run backtest"):
+        try:
+            data = add_indicators(cached_prices(ticker.upper(), period))
+            result = run_backtest(data, risk_percent=risk_percent,
+                                  fee_per_trade=fees, slippage_pct=slippage)
+            metrics = st.columns(6)
+            metrics[0].metric("Total return", f"{result['total_return_pct']:.2f}%")
+            metrics[1].metric("Buy/hold", f"{result['buy_and_hold_return_pct']:.2f}%")
+            metrics[2].metric("Max drawdown", f"{result['max_drawdown_pct']:.2f}%")
+            metrics[3].metric("Win rate", "N/A" if result["win_rate_pct"] is None else f"{result['win_rate_pct']:.1f}%")
+            metrics[4].metric("Profit factor", "N/A" if result["profit_factor"] is None else f"{result['profit_factor']:.2f}")
+            metrics[5].metric("Trades", result["number_of_trades"])
+            chart = go.Figure()
+            chart.add_scatter(x=result["history"].index,
+                              y=result["history"]["Strategy Portfolio"], name="Strategy")
+            chart.add_scatter(x=result["history"].index,
+                              y=result["history"]["Buy and Hold Portfolio"], name="Buy and hold")
+            st.plotly_chart(chart, use_container_width=True)
+            st.dataframe(result["trades"], hide_index=True, use_container_width=True)
+            st.warning("Backtests are simplified and do not predict future performance.")
+        except Exception as error:
+            st.error(str(error))
 
 with tabs[5]:
-    st.subheader("Risk Manager")
-    ticker = st.selectbox("Risk analysis ticker", selected_tickers, key="risk_ticker")
-    portfolio_value = st.number_input("Paper portfolio value", min_value=1_000.0,
-                                      value=starting_cash, step=1_000.0)
+    st.subheader("Paper Trading")
+    st.info("Fake money only. Every simulated order requires confirmation.")
+    ticker = st.text_input("Paper ticker", "AAPL", key="paper_ticker").upper()
+    side = st.radio("Paper action", ["BUY", "SELL"], horizontal=True)
+    amount = st.number_input("Fake dollar amount", 1.0, value=1_000.0)
+    confirmed = st.checkbox("Confirm this is a fake paper order")
     try:
-        decision = get_analysis(ticker, period, False)["decision"]
-        sizing = position_size(portfolio_value, decision["price"], decision["stop_loss"],
-                               risk_percent, max_allocation)
-        metrics = st.columns(6)
-        metrics[0].metric("Max Shares", f"{sizing['max_shares']:,.4f}")
-        metrics[1].metric("Position Value", f"${sizing['position_value']:,.2f}")
-        metrics[2].metric("Risk Budget", f"${sizing['risk_budget']:,.2f}")
-        metrics[3].metric("ATR Stop", f"${decision['stop_loss']:,.2f}")
-        metrics[4].metric("2:1 Target", f"${decision['take_profit_2r']:,.2f}")
-        metrics[5].metric("3:1 Target", f"${decision['take_profit_3r']:,.2f}")
-        st.write(f"Maximum allocation: **{sizing['allocation_pct']:.1f}%** · "
-                 f"risk per share: **${sizing['risk_per_share']:.2f}** · "
-                 f"50-day SMA: **${decision['sma_50']:,.2f}**")
-        for warning in risk_warnings(
-            decision["final_score"], decision["atr_pct"], sizing["allocation_pct"]
-        ):
-            st.warning(warning)
+        price = float(cached_prices(ticker, "1y")["Adj Close"].iloc[-1])
+        st.write(f"Latest daily close: ${price:.2f}")
+        if st.button("Record paper trade", disabled=not confirmed):
+            execute_paper_order(ticker, side, amount, price, starting_cash, confirmed=True)
+            st.success("Fake trade recorded locally.")
+        portfolio = portfolio_summary(starting_cash, {ticker: price})
+        columns = st.columns(4)
+        columns[0].metric("Fake cash", f"${portfolio['cash']:,.2f}")
+        columns[1].metric("Equity", f"${portfolio['equity']:,.2f}")
+        columns[2].metric("Realized P/L", f"${portfolio['realized_pnl']:,.2f}")
+        columns[3].metric("Unrealized P/L", f"${portfolio['unrealized_pnl']:,.2f}")
+        st.dataframe(portfolio["positions"], hide_index=True, use_container_width=True)
+        st.dataframe(portfolio["trades"], hide_index=True, use_container_width=True)
     except Exception as error:
-        st.error(f"Could not calculate risk: {error}")
+        st.error(str(error))
 
 with tabs[6]:
+    st.subheader("Risk Manager")
+    ticker = st.text_input("Risk ticker", "AAPL", key="risk_ticker").upper()
+    portfolio_value = st.number_input("Fake portfolio value", 1_000.0, value=100_000.0)
+    if st.button("Calculate risk plan"):
+        try:
+            decision = analysis_for(ticker, period, False)["decision"]
+            sizing = position_size(portfolio_value, decision["price"], decision["stop_loss"],
+                                   risk_percent, max_allocation)
+            st.write({
+                "suggested_stop_loss": decision["stop_loss"],
+                "atr_stop": decision["atr_stop"],
+                "50_sma_stop": decision["sma_50_stop"],
+                "support_stop": decision["support_stop"],
+                "take_profit_2_to_1": decision["take_profit_2r"],
+                "take_profit_3_to_1": decision["take_profit_3r"],
+                "max_position_size_shares": sizing["max_shares"],
+                "suggested_fake_dollar_amount": sizing["position_value"],
+                "risk_per_share": sizing["risk_per_share"],
+            })
+            for warning in risk_warnings(
+                decision["final_score"], decision["atr_pct"], sizing["allocation_pct"],
+                average_volume=decision["volume_avg_20"],
+            ):
+                st.warning(warning)
+        except Exception as error:
+            st.error(str(error))
+
+with tabs[7]:
     st.subheader("Settings")
     broker = connect_broker()
     st.error(broker["message"])
     st.write({
-        "OpenAI API key configured": bool(os.getenv("OPENAI_API_KEY")),
+        "OpenAI configured": bool(os.getenv("OPENAI_API_KEY")),
         "OpenAI model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        "Broker status": broker["status"],
         "Real trading": "Hard disabled",
-        "Paper storage": "paper_trades.csv and paper_portfolio.csv",
-        "Price/fundamental provider": "Yahoo Finance via yfinance",
-        "Default history": DEFAULT_SCAN_PERIOD,
+        "Universe": "Nasdaq Trader with optional SEC/Alpaca enrichment",
+        "Price data": "Yahoo Finance via yfinance",
+        "Local cache": "cache/",
+        "Scanner export": "scanner_results.csv",
     })
-    st.markdown("#### Optional local `.env`")
-    st.code("OPENAI_API_KEY=your_key\nOPENAI_MODEL=gpt-4.1-mini", language="bash")
-    st.warning("Never commit API keys. OpenAI is optional; all core analysis works locally.")
 
 st.divider()
-st.caption(DISCLAIMER + " Market data can be delayed, incomplete, or inaccurate.")
+st.caption(DISCLAIMER + " Market data may be delayed, incomplete, revised, or unavailable.")
